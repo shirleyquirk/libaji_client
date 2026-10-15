@@ -8,17 +8,19 @@ library behaviour behind it: [`docs/cpp-wrapper/DESIGN.md`](../docs/cpp-wrapper/
 #include "aji/aji.hpp"
 using namespace std::chrono_literals;
 
-auto chain = aji::find([](const aji::HardwareInfo& h) { return h.hw_name.starts_with("USB-Blaster"); });
-if (!chain) return fail(chain.error());
-
-auto idcode = chain->locked(10s, [](auto cl) -> aji::expected<aji::Bits> {
-    auto tap = cl.open_tap(0, aji::ClaimSet{}.add(aji::ClaimType::ir_shared, 6), "me");
+aji::expected<aji::Bits> read_idcode(const aji::Chain& chain)
+{
+    auto cl = chain.lock(10s);                                   // aji_lock_chain
+    if (!cl) return aji::unexpected(cl.error());
+    auto tap = cl->open_tap(0, aji::ClaimSet{}.add(aji::ClaimType::ir_shared, 6), "me");
     if (!tap) return aji::unexpected(tap.error());
-    return cl.with(*tap, aji::Pack::manual, [](auto s) {
-        (void)s.ir(6);                                   // IDCODE
-        return s.dr({.length = 32, .read_length = 32});  // Pending<Bits>, flushed by the time `with` returns
-    });
-});
+    auto s = cl->hand_to(*tap, aji::Pack::manual);               // atomic handoff; *cl is empty now
+    if (!s) return aji::unexpected(s.error());
+    (void)s->ir(6);                                              // IDCODE
+    auto idcode = s->dr({.length = 32, .read_length = 32});      // Pending<Bits>: queued
+    if (auto f = s->flush(); !f) return aji::unexpected(f.error());
+    return idcode.get();
+}   // ~s unlocks, ~tap closes, ~cl is already empty
 ```
 
 ## Requirements
@@ -68,9 +70,9 @@ cmake --build cpp/build && ctest --test-dir cpp/build
   scan, find, the management guard (including the two use-after-free
   scenarios from `tests/ub/05` and `06`, now refused), pin counting, and
   lock failure.
-- **`must_not_compile.*`**: 12 misuses that must be compile errors (scans on
-  the wrong `Kind`, `auto&` sessions, sessions or locks escaping their
-  callback, copying an `Open`, discarding a `Pending`...). Each must fail
+- **`must_not_compile.*`**: 14 misuses that must be compile errors (scans on
+  the wrong `Kind`, copying a lock or an `Open`, discarding a `Pending` or the
+  result of `lock`/`hand_to`/`hand_back`, constructing a held lock...). Each must fail
   with a specific diagnostic, not just fail.
 
 Everything that needs a lock (opens, sessions, handoffs, deferred results)
@@ -82,14 +84,16 @@ Built in `cpp/build/examples/`.
 
 1. **`aji_list`**, then `jtagconfig`. Both should show the same chains, TAP
    IDCODEs and names, SLD nodes and top-level design hash.
-   Exercises: scan, locked, taps, nodes, open_hub, `with` + `Pack::manual`,
+   Exercises: scan, lock, taps, nodes, open_hub, `hand_to`/`hand_back` + `Pack::manual`,
    overlay, batched dr, `Pending` after `flush()`.
 2. **`aji_idcode <cable-substring> [instr=6]`**. Self-checking: reads each
-   TAP's IDCODE via `with` in `Pack::never`, `automatic` and `manual`, then via
-   `Open::locked` after the chain lock is gone. Expect `PASS` on every line for
+   TAP's IDCODE via `hand_to`/`hand_back` in `Pack::never`, `automatic` and
+   `manual`, then via `Open::lock` after the chain lock is released. Expect `PASS` on every line for
    Intel FPGAs (IDCODE = 6); other TAPs need their IDCODE instruction.
-   Exercises: open_tap, all three pack styles, the handback, opens outliving
-   the chain lock, `aji_lock`/`aji_unlock`.
+   Also checks: the `ChainLock` is empty while handed off and held after
+   `hand_back`, open-to-open `Session::hand_to`, `wrong_thread` from another
+   thread. Exercises all three pack styles, every handoff, opens outliving the
+   chain lock, `aji_lock`/`aji_unlock`.
 3. **Contention**: run `aji_idcode` in a loop while the Quartus Programmer or
    SignalTap uses the same cable. Expected: `chain_in_use`/`timeout` errors,
    never a hang or a crash; afterwards both tools work.
@@ -114,14 +118,21 @@ version, and the cable type.
   `Errc::chains_in_use` while any `Chain` or `Open` is alive, because they can
   make the library free those objects (FINDINGS.md §2.4). Drop handles before
   rescanning.
-- **Locks** exist only inside callbacks: `Chain::locked` passes a
-  `ChainLock`, `ChainLock::with`/`Open::locked` pass a `Session<K>`, all as
-  prvalues. Take them as `auto cl` / `auto s`.
+- **Locks** are move-only objects: `Chain::lock` gives a `ChainLock`;
+  `ChainLock::hand_to(open)` moves the lock atomically into a `Session<K>`,
+  `Session::hand_back()` moves it back, `Session::hand_to(other)` moves it to
+  another open on the chain; `Open::lock` takes it directly. An object that
+  doesn't hold the lock (moved from, released, handed off) returns
+  `Errc::empty_lock`; a call from a thread other than the one that locked
+  returns `Errc::wrong_thread`, and destroying a held lock on another thread
+  calls `std::terminate`.
 - **Sessions**: every scan returns `Pending<T>`. Results are ready after
-  `flush()` or when the session ends. After the first error in a session,
-  queued results fail and `with` returns that error.
-- **Handback failures**: the chain is re-locked; if that fails too, the
-  `ChainLock` is lost and returns `Errc::lock_lost` (DESIGN.md §6).
+  `flush()`; the first error fails every result still outstanding, and
+  `flush()` returns it. Releasing (`unlock`/`hand_back`/`hand_to`/destructor)
+  flushes first but reports only what happened to the lock.
+- **Handoff failures**: the old holder keeps the lock, or the wrapper re-takes
+  it; if that fails too, `Errc::lock_lost` and both objects are empty
+  (DESIGN.md §6).
 - **Library bugs left in place** (no patches): dotted IPv4 server addresses
   overflow a buffer inside the library; removing a temporary server is a
   `new[]`/`delete` mismatch; with `QUARTUS_JTAG_CLIENT_NO_LOCAL_SERVER` set and

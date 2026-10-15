@@ -14,6 +14,8 @@ public:
     Pin& operator=(Pin&& other) noexcept;
     ~Pin();
 
+    void reset() noexcept { release(); }   // stop counting (the handle no longer points anywhere)
+
     static long count() noexcept;
 
 private:

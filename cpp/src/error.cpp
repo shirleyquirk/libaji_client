@@ -53,7 +53,9 @@ std::string_view to_string(Errc e) noexcept
     case Errc::chains_in_use:                  return "chains_in_use";
     case Errc::no_match:                       return "no_match";
     case Errc::ambiguous_match:                return "ambiguous_match";
-    case Errc::lock_handed_away:               return "lock_handed_away";
+    case Errc::empty_lock:                     return "empty_lock";
+    case Errc::wrong_thread:                   return "wrong_thread";
+    case Errc::not_from_chain:                 return "not_from_chain";
     case Errc::lock_lost:                      return "lock_lost";
     case Errc::not_flushed:                    return "not_flushed";
     case Errc::buffer_too_small:               return "buffer_too_small";

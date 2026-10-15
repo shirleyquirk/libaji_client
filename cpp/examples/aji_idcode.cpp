@@ -1,11 +1,15 @@
-// aji_idcode: a self-checking hardware test of the session machinery.
+// aji_idcode: a self-checking hardware test of the lock machinery.
 //
 //   aji_idcode <chain-name-substring> [idcode-instruction=6]
 //
 // For every TAP whose IR length is known, it reads IDCODE through the
 // wrapper and compares it with the IDCODE the chain scan reported:
-//   1. through ChainLock::with, once per pack style (never, automatic, manual)
-//   2. through Open::locked (aji_lock) after the chain lock has been released
+//   1. chain -> TAP -> chain (hand_to / hand_back), once per pack style
+//   2. TAP -> next TAP -> chain (Session::hand_to, aji_unlock_lock), if there
+//      are two usable TAPs
+//   3. Open::lock (aji_lock) after the chain lock has been released
+// and checks the lock rules on the way: ChainLock empty while handed off,
+// held again after hand_back, Errc::wrong_thread from another thread.
 // Prints PASS/FAIL per check; exits non-zero if anything failed.
 //
 // The IDCODE instruction is device-specific: 6 is right for Intel FPGAs (10-bit IR).
@@ -16,6 +20,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -26,7 +32,7 @@ int failures = 0;
 
 void report(bool ok, const char* what, std::uint32_t pos, const std::string& detail)
 {
-    std::printf("%s  tap %u  %-24s %s\n", ok ? "PASS" : "FAIL", pos, what, detail.c_str());
+    std::printf("%s  tap %u  %-30s %s\n", ok ? "PASS" : "FAIL", pos, what, detail.c_str());
     if (!ok)
         ++failures;
 }
@@ -46,13 +52,15 @@ std::string hex(std::uint32_t v)
     return b;
 }
 
-// Reads IDCODE in one session: IR <- instruction, then 32 bits of DR.
-auto read_idcode(std::uint32_t instruction)
+// IR <- instruction, then 32 bits of DR, flushed.
+template<aji::Kind K>
+aji::expected<aji::Bits> read_idcode(aji::Session<K>& s, std::uint32_t instruction)
 {
-    return [instruction](auto s) {
-        (void)s.ir(instruction);
-        return s.dr({.length = 32, .read_length = 32});
-    };
+    (void)s.ir(instruction);
+    auto dr = s.dr({.length = 32, .read_length = 32});
+    if (auto f = s.flush(); !f)
+        return aji::unexpected(f.error());
+    return dr.get();
 }
 
 void check(const char* what, const aji::TapInfo& tap, const aji::expected<aji::Bits>& got)
@@ -66,6 +74,11 @@ void check(const char* what, const aji::TapInfo& tap, const aji::expected<aji::B
     report((v & mask) == (tap.idcode & mask), what, tap.position,
            "read " + hex(v) + ", scan said " + hex(tap.idcode));
 }
+
+struct Usable {
+    aji::TapInfo              tap;
+    aji::Open<aji::Kind::tap> open;
+};
 
 } // namespace
 
@@ -87,38 +100,105 @@ int main(int argc, char** argv)
     }
     std::printf("chain: %s\n", chain->info().display_name().c_str());
 
-    // Opens outlive the chain lock: step 2 uses them afterwards.
-    std::vector<std::pair<aji::TapInfo, aji::Open<aji::Kind::tap>>> opened;
+    auto cl = chain->lock(10s);
+    if (!cl) {
+        std::fprintf(stderr, "lock: %s\n", cl.error().message().c_str());
+        return 1;
+    }
 
-    auto step1 = chain->locked(10s, [&](auto cl) -> aji::expected<void> {
-        auto taps = cl.taps();
-        if (!taps)
-            return aji::unexpected(taps.error());
+    // The lock belongs to this thread.
+    {
+        bool refused = false;
+        std::thread([&] {
+            auto r = cl->taps();
+            refused = !r && r.error().code == aji::Errc::wrong_thread;
+        }).join();
+        report(refused, "other thread: wrong_thread", 0, "");
+    }
 
-        for (const aji::TapInfo& tap : *taps) {
-            if (!tap.ir_length_known()) {
-                std::printf("skip  tap %u  IR length unknown\n", tap.position);
-                continue;
-            }
-            auto open = cl.open_tap(tap.position, aji::ClaimSet{}.add(aji::ClaimType::ir_shared, instruction),
-                                    "aji_idcode");
-            if (!open) {
-                report(false, "open_tap", tap.position, open.error().message());
-                continue;
-            }
-            check("with, Pack::never", tap, cl.with(*open, aji::Pack::never, read_idcode(instruction)));
-            check("with, Pack::automatic", tap, cl.with(*open, aji::Pack::automatic, read_idcode(instruction)));
-            check("with, Pack::manual", tap, cl.with(*open, aji::Pack::manual, read_idcode(instruction)));
-            opened.emplace_back(tap, std::move(*open));
+    auto taps = cl->taps();
+    if (!taps) {
+        std::fprintf(stderr, "taps: %s\n", taps.error().message().c_str());
+        return 1;
+    }
+
+    std::vector<Usable> usable;
+    for (const aji::TapInfo& tap : *taps) {
+        if (!tap.ir_length_known()) {
+            std::printf("skip  tap %u  IR length unknown\n", tap.position);
+            continue;
         }
-        return {};
-    });
-    if (!step1)
-        report(false, "chain.locked", 0, step1.error().message());
+        auto open = cl->open_tap(tap.position, aji::ClaimSet{}.add(aji::ClaimType::ir_shared, instruction),
+                                 "aji_idcode");
+        if (!open) {
+            report(false, "open_tap", tap.position, open.error().message());
+            continue;
+        }
+        usable.push_back({tap, std::move(*open)});
+    }
 
-    // The chain lock is released; each open takes the lock itself (aji_lock).
-    for (auto& [tap, open] : opened)
-        check("Open::locked, manual", tap, open.locked(10s, aji::Pack::manual, read_idcode(instruction)));
+    // 1. chain -> TAP -> chain, per pack style.
+    const std::pair<aji::Pack, const char*> packs[] = {
+        {aji::Pack::never, "hand_to, Pack::never"},
+        {aji::Pack::automatic, "hand_to, Pack::automatic"},
+        {aji::Pack::manual, "hand_to, Pack::manual"},
+    };
+    for (auto& [tap, open] : usable) {
+        for (auto [pack, what] : packs) {
+            auto s = cl->hand_to(open, pack);
+            if (!s) {
+                report(false, what, tap.position, s.error().message());
+                continue;
+            }
+            report(!*cl, "ChainLock empty while handed off", tap.position, "");
+            check(what, tap, read_idcode(*s, instruction));
+            auto back = s->hand_back();
+            if (!back) {
+                report(false, "hand_back", tap.position, back.error().message());
+                return 1;   // the lock is gone; nothing more to test
+            }
+            *cl = std::move(*back);
+            report(bool(*cl) && !*s, "hand_back: chain held, session empty", tap.position, "");
+        }
+    }
+
+    // 2. TAP -> next TAP (aji_unlock_lock) -> chain.
+    if (usable.size() >= 2) {
+        auto& [tap0, open0] = usable[0];
+        auto& [tap1, open1] = usable[1];
+        auto s0 = cl->hand_to(open0, aji::Pack::manual);
+        if (!s0) {
+            report(false, "hand_to tap", tap0.position, s0.error().message());
+        } else {
+            check("open->open: first", tap0, read_idcode(*s0, instruction));
+            auto s1 = s0->hand_to(open1);
+            if (!s1) {
+                report(false, "Session::hand_to", tap1.position, s1.error().message());
+            } else {
+                check("open->open: second", tap1, read_idcode(*s1, instruction));
+                auto back = s1->hand_back();
+                if (!back) {
+                    report(false, "hand_back after open->open", tap1.position, back.error().message());
+                    return 1;
+                }
+                *cl = std::move(*back);
+            }
+        }
+    }
+
+    // 3. Release the chain; each open takes the lock itself (aji_lock).
+    if (auto u = cl->unlock(); !u)
+        report(false, "ChainLock::unlock", 0, u.error().message());
+    for (auto& [tap, open] : usable) {
+        auto s = open.lock(10s, aji::Pack::manual);
+        if (!s) {
+            report(false, "Open::lock", tap.position, s.error().message());
+            continue;
+        }
+        check("Open::lock, manual", tap, read_idcode(*s, instruction));
+        if (auto u = s->unlock(); !u)
+            report(false, "Session::unlock", tap.position, u.error().message());
+    }
 
     std::printf("%s (%d failure%s)\n", failures == 0 ? "OK" : "FAILED", failures, failures == 1 ? "" : "s");
     return failures == 0 ? 0 : 1;

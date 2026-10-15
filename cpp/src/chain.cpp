@@ -45,11 +45,13 @@ expected<std::vector<TapInfo>> Chain::cached_taps() const
     return out;
 }
 
-expected<void> Chain::lock(std::chrono::milliseconds timeout) const
+expected<ChainLock> Chain::lock(std::chrono::milliseconds timeout) const
 {
     if (id_ == nullptr)
-        return unexpected(Error{Errc::invalid_chain_id, "Chain::locked", {}});
-    return detail::check(aji_lock_chain(id_, static_cast<DWORD>(timeout.count())), "aji_lock_chain");
+        return unexpected(Error{Errc::invalid_chain_id, "Chain::lock", {}});
+    if (auto e = detail::check(aji_lock_chain(id_, static_cast<DWORD>(timeout.count())), "aji_lock_chain"); !e)
+        return unexpected(e.error());
+    return ChainLock(detail::ChainSeed{id_, info_, timeout});
 }
 
 } // namespace aji

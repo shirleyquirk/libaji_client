@@ -2,58 +2,99 @@
 
 #include "aji/chain_lock.hpp"
 
+#include <exception>
+#include <utility>
+
 
 namespace aji {
 
 using detail::check;
 using detail::from_aji;
 
-ChainLock::~ChainLock()
+ChainLock::ChainLock(detail::ChainSeed seed)
+    : seed_(std::move(seed)), pin_(std::in_place), owner_(std::this_thread::get_id()), held_(true)
+{}
+
+ChainLock::ChainLock(ChainLock&& other) noexcept
+    : seed_(std::move(other.seed_)), pin_(std::move(other.pin_)), owner_(other.owner_),
+      held_(std::exchange(other.held_, false))
 {
-    if (lost_) {
-        if (!out_.error)
-            out_.error = Error{Errc::lock_lost, "ChainLock", {}};
-        return;
+    other.pin_.reset();
+}
+
+ChainLock& ChainLock::operator=(ChainLock&& other) noexcept
+{
+    if (this != &other) {
+        release();
+        seed_ = std::move(other.seed_);
+        pin_ = std::move(other.pin_);
+        other.pin_.reset();
+        owner_ = other.owner_;
+        held_ = std::exchange(other.held_, false);
     }
-    if (AJI_ERROR e = aji_unlock_chain(id_); e != AJI_NO_ERROR && !out_.error)
-        out_.error = from_aji(e, "aji_unlock_chain");
+    return *this;
 }
 
-expected<void> ChainLock::usable(const char* call) const
+ChainLock::~ChainLock() { release(); }
+
+void ChainLock::release() noexcept
 {
-    if (lost_)
-        return unexpected(Error{Errc::lock_lost, call, {}});
-    if (handed_away_)
-        return unexpected(Error{Errc::lock_handed_away, call, {}});
-    return {};
+    if (!held_)
+        return;
+    if (owner_ != std::this_thread::get_id())
+        std::terminate();   // the library's mutex belongs to the owner thread; see chain_lock.hpp
+    aji_unlock_chain(seed_.id);
+    held_ = false;
+    pin_.reset();
 }
 
-expected<void> ChainLock::hand_to(detail::OpenState& open, Pack pack)
+expected<void> ChainLock::unlock()
 {
-    if (auto u = usable("ChainLock::with"); !u)
+    if (auto u = usable("ChainLock::unlock"); !u)
         return u;
-    if (open.in_session)
-        return unexpected(Error{Errc::locked, "ChainLock::with", {}});
-    AJI_ERROR e = aji_unlock_chain_lock(id_, open.id, static_cast<AJI_PACK_STYLE>(pack));
+    AJI_ERROR e = aji_unlock_chain(seed_.id);   // assumes unlocked whatever happens (jtag_client_chain.cpp:880-884)
+    held_ = false;
+    pin_.reset();
+    return check(e, "aji_unlock_chain");
+}
+
+expected<void> ChainLock::usable(const char* call) const { return detail::check_lock(held_, owner_, call); }
+
+expected<std::unique_ptr<detail::SessionCore>> ChainLock::hand_to_core(detail::OpenState* open, Pack pack)
+{
+    if (auto u = usable("ChainLock::hand_to"); !u)
+        return unexpected(u.error());
+    if (open == nullptr)
+        return unexpected(Error{Errc::invalid_open_id, "ChainLock::hand_to", {}});
+    if (open->in_session)
+        return unexpected(Error{Errc::locked, "ChainLock::hand_to", {}});
+    if (open->chain != seed_.id)
+        return unexpected(Error{Errc::invalid_parameter, "ChainLock::hand_to: open is on another chain", {}});
+
+    AJI_ERROR e = aji_unlock_chain_lock(seed_.id, open->id, static_cast<AJI_PACK_STYLE>(pack));
     if (e != AJI_NO_ERROR) {
-        Error err = from_aji(e, "aji_unlock_chain_lock");
+        const Error first = from_aji(e, "aji_unlock_chain_lock");
         // Failures before sending leave the chain locked; a failure after
         // sending leaves nobody holding the lock (jtag_client_open.cpp:544).
         // Re-locking tells them apart: aji_lock_chain returns AJI_LOCKED if we
         // still hold it (jtag_client_chain.cpp:829-830).
-        AJI_ERROR relock = aji_lock_chain(id_, static_cast<DWORD>(relock_timeout_.count()));
-        if (relock != AJI_NO_ERROR && relock != AJI_LOCKED)
-            lost_ = true;
-        return unexpected(err);
+        AJI_ERROR relock = aji_lock_chain(seed_.id, static_cast<DWORD>(seed_.relock_timeout.count()));
+        if (relock == AJI_NO_ERROR || relock == AJI_LOCKED)
+            return unexpected(first);
+        held_ = false;
+        pin_.reset();
+        return unexpected(Error{Errc::lock_lost, "ChainLock::hand_to", first.message()});
     }
-    handed_away_ = true;
-    return {};
+    held_ = false;
+    pin_.reset();
+    return std::make_unique<detail::SessionCore>(*open, pack, seed_, seed_.relock_timeout);
 }
 
-std::unique_ptr<detail::OpenState> ChainLock::adopt(AJI_OPEN* id)
+std::unique_ptr<detail::OpenState> ChainLock::adopt(AJI_OPEN* id, AJI_CHAIN* chain)
 {
     auto state = std::make_unique<detail::OpenState>();
     state->id = id;
+    state->chain = chain;
     return state;
 }
 
@@ -66,7 +107,7 @@ expected<std::vector<TapInfo>> ChainLock::taps(bool auto_scan)
     for (;;) {
         DWORD space = static_cast<DWORD>(devices.size());
         count = space;
-        AJI_ERROR e = aji_read_device_chain(id_, &count, devices.empty() ? nullptr : devices.data(), auto_scan);
+        AJI_ERROR e = aji_read_device_chain(seed_.id, &count, devices.empty() ? nullptr : devices.data(), auto_scan);
         if (e == AJI_TOO_MANY_DEVICES || (e == AJI_NO_ERROR && count > space)) {
             devices.resize(count);
             continue;
@@ -92,7 +133,7 @@ expected<std::vector<SldNodeInfo>> ChainLock::nodes(std::uint32_t tap_position)
         n = static_cast<DWORD>(ids.size());
         // The overload with a trailing int works around wrong idcodes seen
         // with the plain one (aji.h:1820-1835).
-        AJI_ERROR e = aji_get_nodes(id_, tap_position, ids.data(), &n, hubs.data(), 0);
+        AJI_ERROR e = aji_get_nodes(seed_.id, tap_position, ids.data(), &n, hubs.data(), 0);
         if (e == AJI_TOO_MANY_DEVICES) {
             ids.resize(n);
             hubs.resize(n);
@@ -113,7 +154,7 @@ expected<std::uint32_t> ChainLock::parameter(const std::string& name)
     if (auto u = usable("ChainLock::parameter"); !u)
         return unexpected(u.error());
     DWORD value = 0;
-    if (auto e = check(aji_get_parameter(id_, name.c_str(), &value), "aji_get_parameter"); !e)
+    if (auto e = check(aji_get_parameter(seed_.id, name.c_str(), &value), "aji_get_parameter"); !e)
         return unexpected(e.error());
     return value;
 }
@@ -122,7 +163,7 @@ expected<void> ChainLock::set_parameter(const std::string& name, std::uint32_t v
 {
     if (auto u = usable("ChainLock::set_parameter"); !u)
         return u;
-    return check(aji_set_parameter(id_, name.c_str(), value), "aji_set_parameter");
+    return check(aji_set_parameter(seed_.id, name.c_str(), value), "aji_set_parameter");
 }
 
 expected<std::vector<std::uint8_t>> ChainLock::parameter_block(const std::string& name,
@@ -135,7 +176,7 @@ expected<std::vector<std::uint8_t>> ChainLock::parameter_block(const std::string
     std::vector<std::uint8_t> buffer(AJI_PARAMETER_MAX);
     std::copy(send.begin(), send.end(), buffer.begin());
     DWORD size = AJI_PARAMETER_MAX;
-    if (auto e = check(aji_get_parameter(id_, name.c_str(), buffer.data(), &size, static_cast<DWORD>(send.size())),
+    if (auto e = check(aji_get_parameter(seed_.id, name.c_str(), buffer.data(), &size, static_cast<DWORD>(send.size())),
                        "aji_get_parameter");
         !e)
         return unexpected(e.error());
@@ -150,12 +191,12 @@ expected<Open<Kind::tap>> ChainLock::open_tap(std::uint32_t tap_position, const 
         return unexpected(u.error());
     auto c = detail::claims_to(claims);
     AJI_OPEN_ID id = nullptr;
-    if (auto e = check(aji_open_device(id_, tap_position, &id, c.data(), static_cast<DWORD>(c.size()),
+    if (auto e = check(aji_open_device(seed_.id, tap_position, &id, c.data(), static_cast<DWORD>(c.size()),
                                        application.c_str()),
                        "aji_open_device");
         !e)
         return unexpected(e.error());
-    return Open<Kind::tap>(adopt(id));
+    return Open<Kind::tap>(adopt(id, seed_.id));
 }
 
 expected<Open<Kind::sld_node>> ChainLock::open_node(std::uint32_t tap_position, const SldNodeInfo& node,
@@ -166,12 +207,12 @@ expected<Open<Kind::sld_node>> ChainLock::open_node(std::uint32_t tap_position, 
     auto c = detail::claims_to(claims);
     AJI_HIER_ID hier = detail::hier_to(node.id);
     AJI_OPEN_ID id = nullptr;
-    if (auto e = check(aji_open_node(id_, tap_position, &hier, &id, c.data(), static_cast<DWORD>(c.size()),
+    if (auto e = check(aji_open_node(seed_.id, tap_position, &hier, &id, c.data(), static_cast<DWORD>(c.size()),
                                      application.c_str()),
                        "aji_open_node");
         !e)
         return unexpected(e.error());
-    return Open<Kind::sld_node>(adopt(id));
+    return Open<Kind::sld_node>(adopt(id, seed_.id));
 }
 
 expected<Open<Kind::sld_hub>> ChainLock::open_hub(std::uint32_t tap_position, const SldHubAddr& hub,
@@ -182,12 +223,12 @@ expected<Open<Kind::sld_hub>> ChainLock::open_hub(std::uint32_t tap_position, co
     auto c = detail::claims_to(claims);
     AJI_HIER_ID hier = detail::hier_to(hub.node);
     AJI_OPEN_ID id = nullptr;
-    if (auto e = check(aji_open_hub(id_, tap_position, hub.level, &hier, &id, c.data(),
+    if (auto e = check(aji_open_hub(seed_.id, tap_position, hub.level, &hier, &id, c.data(),
                                     static_cast<DWORD>(c.size()), application.c_str()),
                        "aji_open_hub");
         !e)
         return unexpected(e.error());
-    return Open<Kind::sld_hub>(adopt(id));
+    return Open<Kind::sld_hub>(adopt(id, seed_.id));
 }
 
 expected<Open<Kind::entire_chain>> ChainLock::open_entire(ChainType style, const std::string& application)
@@ -195,12 +236,12 @@ expected<Open<Kind::entire_chain>> ChainLock::open_entire(ChainType style, const
     if (auto u = usable("ChainLock::open_entire"); !u)
         return unexpected(u.error());
     AJI_OPEN_ID id = nullptr;
-    if (auto e = check(aji_open_entire_device_chain(id_, &id, static_cast<AJI_CHAIN_TYPE>(style),
+    if (auto e = check(aji_open_entire_device_chain(seed_.id, &id, static_cast<AJI_CHAIN_TYPE>(style),
                                                     application.c_str()),
                        "aji_open_entire_device_chain");
         !e)
         return unexpected(e.error());
-    return Open<Kind::entire_chain>(adopt(id));
+    return Open<Kind::entire_chain>(adopt(id, seed_.id));
 }
 
 } // namespace aji

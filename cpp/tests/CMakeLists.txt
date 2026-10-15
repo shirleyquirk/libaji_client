@@ -7,7 +7,8 @@ set(no_hardware_cases
     management_refused_while_chains_alive
     copies_and_moves_pin
     find_matches_exactly_one
-    locked_reports_lock_failure
+    lock_reports_failure
+    empty_objects_report_empty_lock
     info_survives_library_realloc
     config_edit_by_other_process_is_harmless
     error_messages
@@ -31,14 +32,16 @@ set(must_not_compile
     "ir_bits_on_hub|no matching (member )?function for call to.*ir|constraints not satisfied"
     "ir_dword_on_entire_chain|no matching (member )?function for call to.*ir|constraints not satisfied"
     "overlay_on_tap|no matching (member )?function for call to.*overlay|constraints not satisfied"
-    "session_by_lvalue_ref|no match(ing function)? for call to"
-    "session_escapes|deleted"
     "scan_on_const_session|discards qualifiers|not marked const"
-    "chain_lock_by_lvalue_ref|no match(ing function)? for call to"
-    "chain_lock_escapes|deleted"
+    "copy_chain_lock|deleted"
+    "copy_session|deleted"
     "copy_open|deleted"
     "construct_chain|private"
+    "construct_held_chain_lock|private"
     "discard_pending|nodiscard|unused-result"
+    "discard_hand_to|nodiscard|unused-result"
+    "discard_hand_back|nodiscard|unused-result"
+    "discard_lock|nodiscard|unused-result"
 )
 foreach(entry IN LISTS must_not_compile)
     string(FIND "${entry}" "|" bar)

@@ -2,8 +2,8 @@
 // objects, their strings, or whole server connections (FINDINGS.md §2.4).
 //
 // Each returns Errc::chains_in_use, without calling the library, while any
-// Chain or Open is alive. That turns what would be a use-after-free into an
-// error. The library frees things only inside these calls; there are no
+// Chain, held ChainLock or Open is alive. That turns what would be a
+// use-after-free into an error. The library frees things only inside these calls; there are no
 // background threads, so holding a Chain is safe between them.
 //
 // They are also serialised against each other (one process-wide mutex): the

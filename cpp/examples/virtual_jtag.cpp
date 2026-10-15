@@ -6,15 +6,18 @@
 // <hex-data> (default 0) through its virtual DR <count> times, printing what
 // came back each time. What the DR means is up to your design.
 //
-// Shows: finding an SLD node by type, open_node, Session<Kind::sld_node>
-// (overlay + dr; `ir` doesn't compile for nodes), Pack::manual with several
-// Pendings collected and read after one flush.
+// Shows: discovery under the chain lock, then the lock handed atomically to
+// the node and back (no other client can reconfigure the FPGA in between),
+// a helper function that borrows the ChainLock, Session<Kind::sld_node>
+// (overlay + dr; `ir` doesn't compile for nodes), and Pack::manual with
+// several Pendings read after one flush.
 #include "aji/aji.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -31,6 +34,71 @@ std::uint32_t node_instance(std::uint32_t id) { return id & 0xFF; }
 std::uint32_t node_vendor(std::uint32_t id) { return (id >> 8) & 0x7FF; }
 std::uint32_t node_type(std::uint32_t id) { return (id >> 19) & 0xFF; }
 constexpr std::uint32_t INTEL = 110, VIRTUAL_JTAG = 8;
+
+struct Found {
+    std::uint32_t    tap_position;
+    aji::SldNodeInfo node;
+};
+
+// Discovery: every TAP with an SLD hub lists its nodes.
+aji::expected<Found> find_instance(aji::ChainLock& cl, std::uint32_t instance)
+{
+    auto taps = cl.taps();
+    if (!taps)
+        return aji::unexpected(taps.error());
+    for (const aji::TapInfo& tap : *taps) {
+        auto nodes = cl.nodes(tap.position);
+        if (!nodes)
+            continue;   // no hub, or not readable: not ours
+        for (const aji::SldNodeInfo& n : *nodes)
+            if (node_vendor(n.idcode()) == INTEL && node_type(n.idcode()) == VIRTUAL_JTAG &&
+                node_instance(n.idcode()) == instance)
+                return Found{tap.position, n};
+    }
+    return aji::unexpected(aji::Error{aji::Errc::no_matching_nodes, "virtual_jtag: no such instance", {}});
+}
+
+// Borrows the caller's chain lock: hands it to the node, scans, hands it
+// back into `cl`. If the handback loses the lock, `cl` stays empty.
+aji::expected<std::vector<aji::Bits>> transfer(aji::ChainLock& cl, const Found& where, std::uint32_t vir,
+                                               aji::BitsView data, std::uint32_t count)
+{
+    auto node = cl.open_node(where.tap_position, where.node,
+                             aji::ClaimSet{}
+                                 .add(aji::ClaimType::ir_shared_overlay, USER1)
+                                 .add(aji::ClaimType::ir_shared_overlaid, USER0)
+                                 .add(aji::ClaimType::overlay_shared, vir),
+                             "virtual_jtag");
+    if (!node)
+        return aji::unexpected(node.error());
+
+    auto s = cl.hand_to(*node, aji::Pack::manual);   // cl is empty until hand_back
+    if (!s)
+        return aji::unexpected(s.error());
+
+    (void)s->overlay(vir);
+    std::vector<aji::Pending<aji::Bits>> pending;
+    for (std::uint32_t i = 0; i < count; ++i)
+        pending.push_back(s->dr({.length = data.length, .write = data, .read_length = data.length}));
+    // Before the flush every pending.get() would be Errc::not_flushed.
+    auto flushed = s->flush();
+
+    auto back = s->hand_back();
+    if (!back)
+        return aji::unexpected(back.error());
+    cl = std::move(*back);
+    if (!flushed)
+        return aji::unexpected(flushed.error());
+
+    std::vector<aji::Bits> out;
+    for (auto& p : pending) {
+        auto bits = p.get();
+        if (!bits)
+            return aji::unexpected(bits.error());
+        out.push_back(std::move(*bits));
+    }
+    return out;
+}   // ~node: closed (not locked any more); ~s: empty
 
 // "1A2B" -> little-endian bytes, `bits` long.
 std::vector<std::uint8_t> parse_hex(const std::string& hex, std::uint32_t bits)
@@ -79,58 +147,17 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    auto results = chain->locked(10s, [&](auto cl) -> aji::expected<std::vector<aji::Bits>> {
-        // Find the node: every TAP with an SLD hub lists its nodes.
-        auto taps = cl.taps();
-        if (!taps)
-            return aji::unexpected(taps.error());
-        std::optional<std::pair<std::uint32_t, aji::SldNodeInfo>> found;
-        for (const aji::TapInfo& tap : *taps) {
-            auto nodes = cl.nodes(tap.position);
-            if (!nodes)
-                continue;   // no hub, or not readable: not ours
-            for (const aji::SldNodeInfo& n : *nodes)
-                if (node_vendor(n.idcode()) == INTEL && node_type(n.idcode()) == VIRTUAL_JTAG &&
-                    node_instance(n.idcode()) == instance)
-                    found.emplace(tap.position, n);
-        }
-        if (!found)
-            return aji::unexpected(aji::Error{aji::Errc::no_matching_nodes, "virtual_jtag: no such instance", {}});
-
-        // Claim USER1 as the overlay, USER0 as overlaid, and our VIR value.
-        auto node = cl.open_node(found->first, found->second,
-                                 aji::ClaimSet{}
-                                     .add(aji::ClaimType::ir_shared_overlay, USER1)
-                                     .add(aji::ClaimType::ir_shared_overlaid, USER0)
-                                     .add(aji::ClaimType::overlay_shared, vir),
-                                 "virtual_jtag");
-        if (!node)
-            return aji::unexpected(node.error());
-
-        // All scans are queued (Pack::manual) and sent together at the flush.
-        return cl.with(*node, aji::Pack::manual, [&](auto s) -> aji::expected<std::vector<aji::Bits>> {
-            (void)s.overlay(vir);
-            std::vector<aji::Pending<aji::Bits>> pending;
-            for (std::uint32_t i = 0; i < count; ++i)
-                pending.push_back(s.dr({.length = dr_bits,
-                                        .write = aji::BitsView{data, dr_bits},
-                                        .read_length = dr_bits}));
-
-            // Before the flush every pending.get() would be Errc::not_flushed.
-            if (auto f = s.flush(); !f)
-                return aji::unexpected(f.error());
-
-            std::vector<aji::Bits> out;
-            for (auto& p : pending) {
-                auto bits = p.get();
-                if (!bits)
-                    return aji::unexpected(bits.error());
-                out.push_back(std::move(*bits));
-            }
-            return out;
-        });
-    });
-
+    auto cl = chain->lock(10s);
+    if (!cl) {
+        std::fprintf(stderr, "%s\n", cl.error().message().c_str());
+        return 1;
+    }
+    auto where = find_instance(*cl, instance);
+    if (!where) {
+        std::fprintf(stderr, "%s\n", where.error().message().c_str());
+        return 1;
+    }
+    auto results = transfer(*cl, *where, vir, aji::BitsView{data, dr_bits}, count);
     if (!results) {
         std::fprintf(stderr, "%s\n", results.error().message().c_str());
         return 1;

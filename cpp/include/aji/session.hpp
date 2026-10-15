@@ -1,22 +1,29 @@
-// Session<K>: an open that currently holds the connection's lock.
+// Session<K>: an open while it holds the lock. Move-only.
 //
-// You never construct one. ChainLock::with and Open<K>::locked build it and
-// pass it to your callback as a prvalue; when the callback's parameter is
-// destroyed (before `with`/`locked` continues), the session flushes queued
-// scans and hands the lock back. Take it as `auto s`:
+// You get one from ChainLock::hand_to (the chain's lock, handed over
+// atomically) or from Open<K>::lock (aji_lock). A Session is either *held*
+// or *empty*; it becomes empty when moved from, after unlock(), hand_back()
+// or hand_to(), or when a failed handoff loses the lock.
 //
-//     chain_lock.with(hub, aji::Pack::manual, [](auto s) {
-//         s.overlay(HUB_IDENT);
-//         return s.dr({.length = 4, .read_length = 4, .batch = 32});
-//     });
+//     auto s = cl.hand_to(tap, aji::Pack::manual);     // cl is now empty
+//     (void)s->ir(IDCODE);
+//     auto id = s->dr({.length = 32, .read_length = 32});
+//     s->flush();                                      // id.get() is ready
+//     auto back = s->hand_back();                      // the chain's lock again
 //
-// `auto& s` doesn't compile (a prvalue can't bind to it), and `const auto s`
-// allows no scans (they are non-const). See docs/cpp-wrapper/DESIGN.md §5.
+// Every call on an empty session fails with Errc::empty_lock, and on a
+// thread other than the one that took the lock with Errc::wrong_thread (the
+// library's mutex belongs to that thread, FINDINGS.md §1.1). Destroying a
+// held session flushes it and unlocks (the lock goes to nobody, not back to
+// a chain); destroying it on the wrong thread calls std::terminate, as
+// ~std::thread does for a joinable thread.
 //
-// Errors: every scan returns a Pending. After the first error in a session,
-// queued results are unreliable (the library reports one error per batch and
-// fills no buffers after it), so all of them fail, and `with`/`locked`
-// returns that first error instead of the callback's value.
+// Errors. Scans return Pending<T>: with Pack::manual they only run at the
+// next flush. The first error fails every result still outstanding, because
+// the library reports one error per batch and fills no buffers after it
+// (FINDINGS.md §3.2). flush() returns that error; unlock(), hand_back() and
+// hand_to() flush first but report only what happened to the lock, so call
+// flush() if you need to know whether write-only scans worked.
 #pragma once
 
 #include "aji/detail/session_core.hpp"
@@ -25,8 +32,7 @@
 #include "aji/types.hpp"
 
 #include <chrono>
-#include <type_traits>
-#include <utility>
+#include <memory>
 
 namespace aji {
 
@@ -41,120 +47,115 @@ enum class Kind {
 template<Kind K>
 inline constexpr bool is_virtual = (K == Kind::sld_node || K == Kind::sld_hub);
 
-namespace detail { struct SessionFactory; }
+class ChainLock;
+template<Kind K> class Open;
 
 template<Kind K>
 class Session {
 public:
-    Session(const Session&) = delete;
-    Session(Session&&) = delete;
-    Session& operator=(const Session&) = delete;
-    Session& operator=(Session&&) = delete;
-    ~Session() = default;   // the core flushes and hands the lock back
+    Session() = default;                                    // empty
+    Session(Session&&) noexcept = default;
+    Session& operator=(Session&&) noexcept = default;       // releases what *this held first
+    ~Session() = default;                                   // the core flushes and unlocks if held
+
+    explicit operator bool() const noexcept { return core_ && core_->held(); }
+
+    // ---- scans ----
 
     // Load an instruction into this TAP's IR; the value captured from IR.
     Pending<std::uint32_t> ir(std::uint32_t instruction) requires (K == Kind::tap)
     {
-        return Pending(core_.ir_value(instruction));
+        return scan<std::uint32_t>("Session::ir", [&] { return core_->ir_value(instruction); });
     }
 
-    // Shift `write.length` bits through IR (for EntireChain: the whole chain's
-    // IR, unvalidated); the bits captured.
+    // Shift `write.length` bits through IR (for entire_chain: the whole
+    // chain's IR, unvalidated); the bits captured.
     Pending<Bits> ir(BitsView write) requires (!is_virtual<K>)
     {
-        return Pending(core_.ir_bits(write));
+        return scan<Bits>("Session::ir", [&] { return core_->ir_bits(write); });
     }
 
     // SLD nodes and hubs: write the virtual IR (USER1 + DR + USER0); the
     // value captured from the overlay register.
     Pending<std::uint32_t> overlay(std::uint32_t value) requires (is_virtual<K>)
     {
-        return Pending(core_.overlay(value));
+        return scan<std::uint32_t>("Session::overlay", [&] { return core_->overlay(value); });
     }
 
     // One data-register scan; the bits read (empty if read_length == 0).
-    Pending<Bits> dr(const DrScan& scan) { return Pending(core_.dr(scan)); }
+    Pending<Bits> dr(const DrScan& scan_) { return scan<Bits>("Session::dr", [&] { return core_->dr(scan_); }); }
 
     // Run-Test/Idle for `clocks` cycles.
-    Pending<void> idle(std::uint32_t clocks, RtiFlags flags = {}) { return Pending(core_.idle(clocks, flags)); }
+    Pending<void> idle(std::uint32_t clocks, RtiFlags flags = {})
+    {
+        return scan<void>("Session::idle", [&] { return core_->idle(clocks, flags); });
+    }
 
     // Test-Logic-Reset. Resets every TAP on the chain, whatever K is.
-    Pending<void> reset() { return Pending(core_.reset()); }
+    Pending<void> reset() { return scan<void>("Session::reset", [&] { return core_->reset(); }); }
 
     // Pause the clock for at least `us`.
-    Pending<void> delay(std::chrono::microseconds us) { return Pending(core_.delay(us)); }
+    Pending<void> delay(std::chrono::microseconds us)
+    {
+        return scan<void>("Session::delay", [&] { return core_->delay(us); });
+    }
 
-    // Run everything queued so far; afterwards their Pendings are ready.
-    expected<void> flush() { return core_.flush(); }
+    // Run everything queued; afterwards every Pending issued so far is ready.
+    expected<void> flush()
+    {
+        if (!core_)
+            return unexpected(Error{Errc::empty_lock, "Session::flush", {}});
+        return core_->flush();
+    }
 
-    Pack pack() const noexcept { return core_.pack(); }
+    Pack pack() const noexcept { return core_ ? core_->pack() : Pack::never; }
+
+    // ---- releasing the lock (each leaves this session empty) ----
+
+    // aji_unlock: the lock goes to nobody.
+    [[nodiscard]] expected<void> unlock()
+    {
+        if (!core_)
+            return unexpected(Error{Errc::empty_lock, "Session::unlock", {}});
+        auto r = core_->unlock();
+        if (!core_->held())   // still held only if refused (wrong thread)
+            core_.reset();
+        return r;
+    }
+
+    // Atomic handback to the chain (aji_unlock_lock_chain), for a session
+    // that came from ChainLock::hand_to; Errc::not_from_chain otherwise. If
+    // the library fails the handback, the chain is re-locked (no longer
+    // atomically); Errc::lock_lost if even that fails. Defined in
+    // chain_lock.hpp.
+    [[nodiscard]] expected<ChainLock> hand_back();
+
+    // Atomic move to another open on the same chain (aji_unlock_lock); the
+    // pack style carries over. On success this session is empty. On failure
+    // it still holds the lock, unless the lock was lost (Errc::lock_lost,
+    // and this session is empty). Defined in open.hpp.
+    template<Kind K2>
+    [[nodiscard]] expected<Session<K2>> hand_to(Open<K2>& next);
 
 private:
-    friend struct detail::SessionFactory;
+    friend class ChainLock;
+    template<Kind> friend class Open;
+    template<Kind> friend class Session;
 
-    Session(detail::OpenState& open, Pack pack, detail::SessionCore::Release release,
-            ChainLock* chain, detail::Handback& out) noexcept
-        : core_(open, pack, release, chain, out)
-    {}
+    explicit Session(std::unique_ptr<detail::SessionCore> core) : core_(std::move(core)) {}
 
-    detail::SessionCore core_;
-};
-
-namespace detail {
-
-// The type of `f(T{...})` where the argument is a prvalue. std::invoke_result
-// can't express that: it passes an xvalue, which can't initialise a by-value
-// parameter of a non-movable type, so it reports "not invocable" for
-// `[](auto s)`. `prvalue<T>()` is never defined; it only appears in decltype.
-template<class T>
-T prvalue() noexcept;
-
-template<class F, class Arg>
-using call_result_t = decltype(std::declval<F&>()(prvalue<Arg>()));
-
-// What `with`/`locked` return for a callback returning R:
-//   void -> expected<void>,  expected<T> -> expected<T>,  Pending<T> -> expected<T>,  T -> expected<T>
-template<class R> struct settled                 { using type = R; };
-template<class T> struct settled<expected<T>>    { using type = T; };
-template<class T> struct settled<Pending<T>>     { using type = T; };
-template<class R> using settled_t = typename settled<std::remove_cvref_t<R>>::type;
-
-template<class R>
-expected<settled_t<R>> settle(R&& r)
-{
-    using D = std::remove_cvref_t<R>;
-    if constexpr (std::is_same_v<D, expected<settled_t<R>>>)
-        return std::forward<R>(r);
-    else if constexpr (std::is_same_v<D, Pending<settled_t<R>>>)
-        return r.get();
-    else
-        return expected<settled_t<R>>(std::forward<R>(r));
-}
-
-// Calls `f` with a prvalue Session and collects the outcome. Whether the
-// parameter is destroyed when `f` returns or at the end of the full
-// expression below, it is before the next statement ([expr.call]), so the
-// handback has happened by the time we read `out`.
-struct SessionFactory {
-    template<Kind K, class F>
-    static auto run(OpenState& open, Pack pack, SessionCore::Release release, ChainLock* chain, F& f)
-        -> expected<settled_t<call_result_t<F, Session<K>>>>
+    template<class T, class Fn>
+    Pending<T> scan(const char* call, Fn&& fn)
     {
-        using R = call_result_t<F, Session<K>>;
-        Handback out;
-        if constexpr (std::is_void_v<R>) {
-            f(Session<K>(open, pack, release, chain, out));
-            if (out.error)
-                return unexpected(*out.error);
-            return {};
-        } else {
-            R result = f(Session<K>(open, pack, release, chain, out));
-            if (out.error)
-                return unexpected(*out.error);
-            return settle(std::move(result));
+        if (!core_) {
+            auto slot = std::make_shared<detail::Slot<T>>();
+            slot->fail(Error{Errc::empty_lock, call, {}});
+            return Pending<T>(std::move(slot));
         }
+        return Pending<T>(fn());
     }
+
+    std::unique_ptr<detail::SessionCore> core_;
 };
 
-} // namespace detail
 } // namespace aji

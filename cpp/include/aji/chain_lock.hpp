@@ -1,14 +1,26 @@
-// ChainLock: a chain whose lock this thread holds (aji_lock_chain).
+// ChainLock: a chain's lock (aji_lock_chain). Move-only.
 //
-// You never construct one: Chain::locked passes it to your callback as a
-// prvalue and unlocks when the callback's parameter is destroyed. Take it as
-// `auto cl` (or `auto&&`); helper functions can take `aji::ChainLock&`.
+// From Chain::lock. Either *held* or *empty*: it becomes empty when moved
+// from, after unlock(), after a successful hand_to(), or when a failed
+// handoff loses the lock. Every call on an empty lock fails with
+// Errc::empty_lock, and on a thread other than the one that locked with
+// Errc::wrong_thread (FINDINGS.md §1.1). Destroying a held lock unlocks it;
+// destroying it on the wrong thread calls std::terminate.
 //
 // While held, no other client can use the chain, and no other thread of this
-// process can talk to the same server (FINDINGS.md §1.1). Keep it short.
+// process can talk to the same server. Keep it short.
+//
+//     auto cl = chain.lock(10s);
+//     auto taps = cl->taps();
+//     auto tap = cl->open_tap(0, claims, "me");
+//     auto s = cl->hand_to(*tap, aji::Pack::manual);   // atomic; *cl is now empty
+//     ...
+//     auto back = s->hand_back();                      // atomic; a held ChainLock again
 #pragma once
 
 #include "aji/detail/handles.hpp"
+#include "aji/detail/pin.hpp"
+#include "aji/detail/session_core.hpp"
 #include "aji/error.hpp"
 #include "aji/open.hpp"
 #include "aji/session.hpp"
@@ -18,27 +30,30 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace aji {
 
 class Chain;
 
-namespace detail {
-struct ChainLockResult {
-    std::optional<Error> error;
-};
-}
-
 class ChainLock {
 public:
+    ChainLock() = default;                          // empty
+    ChainLock(ChainLock&& other) noexcept;
+    ChainLock& operator=(ChainLock&& other) noexcept;   // releases what *this held first
     ChainLock(const ChainLock&) = delete;
-    ChainLock(ChainLock&&) = delete;
     ChainLock& operator=(const ChainLock&) = delete;
-    ChainLock& operator=(ChainLock&&) = delete;
-    ~ChainLock();                                   // aji_unlock_chain, unless the lock was lost
+    ~ChainLock();                                   // aji_unlock_chain if held
 
-    const HardwareInfo& info() const noexcept { return info_; }
+    explicit operator bool() const noexcept { return held_; }
+
+    // The chain this lock is (or was) for.
+    const HardwareInfo& info() const noexcept { return seed_.info; }
+
+    // aji_unlock_chain, reporting its error. Empty afterwards (unless refused
+    // with wrong_thread).
+    [[nodiscard]] expected<void> unlock();
 
     // ---- chain operations ----
 
@@ -66,48 +81,50 @@ public:
 
     // ---- handing the lock to an open ----
 
-    // Hands this chain's lock to `open` (aji_unlock_chain_lock), runs `f` with
-    // a prvalue Session<K>, then hands it back (aji_unlock_lock_chain). If the
-    // handback fails, the chain is re-locked with this lock's original
-    // timeout; if that fails too, this ChainLock is lost and every later call
-    // returns Errc::lock_lost (DESIGN.md §6).
-    //
-    // While `f` runs, calls on this ChainLock return Errc::lock_handed_away.
-    template<Kind K, class F>
-    auto with(Open<K>& open, Pack pack, F&& f)
-        -> expected<detail::settled_t<detail::call_result_t<F, Session<K>>>>
+    // Atomic handoff (aji_unlock_chain_lock). On success this lock is empty
+    // and the returned session holds the lock; get it back with
+    // Session::hand_back. On failure this lock still holds the lock, unless
+    // the library dropped it and re-locking failed too: then the error is
+    // Errc::lock_lost and this lock is empty (DESIGN.md §6).
+    template<Kind K>
+    [[nodiscard]] expected<Session<K>> hand_to(Open<K>& open, Pack pack)
     {
-        if (!open.state_)
-            return unexpected(Error{Errc::invalid_open_id, "ChainLock::with", {}});
-        if (auto e = hand_to(*open.state_, pack); !e)
-            return unexpected(e.error());
-        struct Reset {
-            ChainLock& lock;
-            ~Reset() { lock.handed_away_ = false; }
-        } reset{*this};
-        return detail::SessionFactory::run<K>(*open.state_, pack, detail::SessionCore::Release::to_chain,
-                                              this, f);
+        auto core = hand_to_core(open.state_.get(), pack);
+        if (!core)
+            return unexpected(core.error());
+        return Session<K>(std::move(*core));
     }
 
 private:
     friend class Chain;
-    friend class detail::SessionCore;
+    template<Kind> friend class Session;
 
-    ChainLock(AJI_CHAIN* id, std::chrono::milliseconds timeout, const HardwareInfo& info,
-              detail::ChainLockResult& out) noexcept
-        : id_(id), relock_timeout_(timeout), info_(info), out_(out)
-    {}
+    explicit ChainLock(detail::ChainSeed seed);     // held, by this thread
 
     expected<void> usable(const char* call) const;
-    expected<void> hand_to(detail::OpenState& open, Pack pack);
-    static std::unique_ptr<detail::OpenState> adopt(AJI_OPEN* id);
+    expected<std::unique_ptr<detail::SessionCore>> hand_to_core(detail::OpenState* open, Pack pack);
+    static std::unique_ptr<detail::OpenState> adopt(AJI_OPEN* id, AJI_CHAIN* chain);
+    void release() noexcept;                        // unlock if held; terminate on the wrong thread
 
-    AJI_CHAIN*                 id_;
-    std::chrono::milliseconds  relock_timeout_;
-    const HardwareInfo&        info_;
-    detail::ChainLockResult&   out_;
-    bool                       handed_away_ = false;
-    bool                       lost_ = false;
+    detail::ChainSeed          seed_;
+    std::optional<detail::Pin> pin_;                // engaged while held
+    std::thread::id            owner_;
+    bool                       held_ = false;
 };
+
+template<Kind K>
+expected<ChainLock> Session<K>::hand_back()
+{
+    if (!core_)
+        return unexpected(Error{Errc::empty_lock, "Session::hand_back", {}});
+    if (!core_->chain())
+        return unexpected(Error{Errc::not_from_chain, "Session::hand_back", {}});
+    auto seed = core_->hand_back();
+    if (!core_->held())
+        core_.reset();
+    if (!seed)
+        return unexpected(seed.error());
+    return ChainLock(std::move(*seed));
+}
 
 } // namespace aji

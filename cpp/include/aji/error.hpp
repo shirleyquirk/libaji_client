@@ -67,10 +67,13 @@ enum class Errc : int {
     chains_in_use              = 1000,
     no_match                   = 1001,  // find*: nothing matched
     ambiguous_match            = 1002,  // find*: more than one matched
-    lock_handed_away           = 1003,  // ChainLock used while one of its opens holds the lock
-    lock_lost                  = 1004,  // the lock could not be handed back or re-taken
+    empty_lock                 = 1003,  // ChainLock/Session that holds no lock: moved from,
+                                        // unlocked, handed off, or lost
+    lock_lost                  = 1004,  // a handoff failed and the lock couldn't be re-taken
     not_flushed                = 1005,  // Pending::get() before its batch was flushed
     buffer_too_small           = 1006,  // a BitsView shorter than the length it claims
+    wrong_thread               = 1007,  // the lock belongs to the thread that took it
+    not_from_chain             = 1008,  // Session::hand_back on a session from Open::lock
 };
 
 const std::error_category& category() noexcept;

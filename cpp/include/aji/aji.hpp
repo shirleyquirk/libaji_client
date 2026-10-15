@@ -1,10 +1,10 @@
 // C++23 RAII wrapper for libaji_client (aji.h). Everything in one include.
 //
 //   management.hpp   aji::scan, aji::find*, server and device-database functions
-//   chain.hpp        aji::Chain            a cable/chain; lock it with locked()
-//   chain_lock.hpp   aji::ChainLock        the chain while this thread holds its lock
+//   chain.hpp        aji::Chain            a cable/chain; lock() it
+//   chain_lock.hpp   aji::ChainLock        the chain's lock (move-only); hand_to() an open
 //   open.hpp         aji::Open<K>          an opened TAP, whole chain, SLD node or hub
-//   session.hpp      aji::Session<K>       an open while it holds the lock: the scans
+//   session.hpp      aji::Session<K>       an open's lock (move-only): the scans; hand_back()
 //   pending.hpp      aji::Pending<T>       a scan result that may not have arrived yet
 //   types.hpp        value types (HardwareInfo, TapInfo, SldNodeInfo, ClaimSet, Bits, ...)
 //   error.hpp        aji::Error, aji::Errc, aji::expected<T>

@@ -4,7 +4,7 @@
 //   jtag_clock <cable-substring> 6000000      set JtagClock to 6 MHz
 //
 // Same as `jtagconfig --getparam/--setparam`. Shows: ChainLock::parameter,
-// set_parameter, and a callback that returns expected<void>.
+// set_parameter, and unlock() to see the unlock's own error.
 #include "aji/aji.hpp"
 
 #include <cstdio>
@@ -33,23 +33,26 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    auto done = chain->locked(10s, [&](auto cl) -> aji::expected<void> {
-        if (new_clock) {
-            if (auto set = cl.set_parameter("JtagClock", *new_clock); !set)
-                return set;   // "aji_set_parameter: unimplemented" if the cable has no such parameter
-        }
-        for (const char* name : {"JtagClock", "JtagClockAutoAdjust"}) {
-            auto value = cl.parameter(name);
-            if (value)
-                std::printf("%-20s %u\n", name, *value);
-            else
-                std::printf("%-20s (%s)\n", name, value.error().message().c_str());
-        }
-        return {};
-    });
-    if (!done) {
-        std::fprintf(stderr, "%s\n", done.error().message().c_str());
+    auto cl = chain->lock(10s);
+    if (!cl) {
+        std::fprintf(stderr, "%s\n", cl.error().message().c_str());
         return 1;
     }
+    if (new_clock) {
+        if (auto set = cl->set_parameter("JtagClock", *new_clock); !set) {
+            std::fprintf(stderr, "%s\n", set.error().message().c_str());   // "unimplemented": no such parameter
+            return 1;
+        }
+    }
+    for (const char* name : {"JtagClock", "JtagClockAutoAdjust"}) {
+        auto value = cl->parameter(name);
+        if (value)
+            std::printf("%-20s %u\n", name, *value);
+        else
+            std::printf("%-20s (%s)\n", name, value.error().message().c_str());
+    }
+    // The destructor would unlock too; unlock() also reports its error.
+    if (auto u = cl->unlock(); !u)
+        std::fprintf(stderr, "%s\n", u.error().message().c_str());
     return 0;
 }

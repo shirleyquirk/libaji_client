@@ -158,7 +158,7 @@ void find_matches_exactly_one()
     CHECK_ERRC(aji::find([](auto& h) { return h.is_dummy(); }), aji::Errc::ambiguous_match);
 }
 
-void locked_reports_lock_failure()
+void lock_reports_failure()
 {
     write_config("");
     CHECK(aji::add_remote_server("localhost:1", "pw", aji::Persist::temporary));
@@ -166,13 +166,47 @@ void locked_reports_lock_failure()
     CHECK(chain);
     if (!chain)
         return;
-    bool called = false;
     // A dummy chain has no server-side id, so aji_lock_chain refuses it.
-    auto r = chain->locked(100ms, [&](auto) { called = true; return 42; });
-    CHECK_ERRC(r, aji::Errc::invalid_chain_id);
-    CHECK(!called);
-    if (!r)
-        CHECK(std::string_view(r.error().call) == "aji_lock_chain");
+    auto cl = chain->lock(100ms);
+    CHECK_ERRC(cl, aji::Errc::invalid_chain_id);
+    if (!cl)
+        CHECK(std::string_view(cl.error().call) == "aji_lock_chain");
+}
+
+// Every call on a lock object that holds nothing reports it, instead of
+// reaching the library. (Locks that *were* held need hardware to test.)
+void empty_objects_report_empty_lock()
+{
+    aji::ChainLock cl;   // empty
+    CHECK(!cl);
+    CHECK_ERRC(cl.taps(), aji::Errc::empty_lock);
+    CHECK_ERRC(cl.nodes(0), aji::Errc::empty_lock);
+    CHECK_ERRC(cl.parameter("JtagClock"), aji::Errc::empty_lock);
+    CHECK_ERRC(cl.open_tap(0, {}, "test"), aji::Errc::empty_lock);
+    CHECK_ERRC(cl.unlock(), aji::Errc::empty_lock);
+
+    aji::Open<aji::Kind::tap> open;   // empty
+    CHECK(!open);
+    CHECK_ERRC(cl.hand_to(open, aji::Pack::never), aji::Errc::empty_lock);   // the lock is checked first
+    CHECK_ERRC(open.lock(1ms, aji::Pack::never), aji::Errc::invalid_open_id);
+
+    aji::Session<aji::Kind::tap> s;   // empty
+    CHECK(!s);
+    auto ir = s.ir(6);
+    CHECK(ir.ready());
+    CHECK_ERRC(ir.get(), aji::Errc::empty_lock);
+    CHECK_ERRC(s.dr({.length = 32, .read_length = 32}).get(), aji::Errc::empty_lock);
+    CHECK_ERRC(s.flush(), aji::Errc::empty_lock);
+    CHECK_ERRC(s.unlock(), aji::Errc::empty_lock);
+    CHECK_ERRC(s.hand_back(), aji::Errc::empty_lock);
+    CHECK_ERRC(s.hand_to(open), aji::Errc::empty_lock);
+
+    // Moving keeps "empty" empty, and leaves the source empty.
+    aji::ChainLock moved = std::move(cl);
+    CHECK(!moved && !cl);
+    aji::Session<aji::Kind::tap> s2 = std::move(s);
+    CHECK(!s2 && !s);
+    CHECK(aji::detail::Pin::count() == 0);   // empty locks pin nothing
 }
 
 // tests/ub/05 with the wrapper: a rescan that reallocates the library's
@@ -245,7 +279,8 @@ const std::map<std::string_view, std::function<void()>> cases = {
     {"management_refused_while_chains_alive", management_refused_while_chains_alive},
     {"copies_and_moves_pin", copies_and_moves_pin},
     {"find_matches_exactly_one", find_matches_exactly_one},
-    {"locked_reports_lock_failure", locked_reports_lock_failure},
+    {"lock_reports_failure", lock_reports_failure},
+    {"empty_objects_report_empty_lock", empty_objects_report_empty_lock},
     {"info_survives_library_realloc", info_survives_library_realloc},
     {"config_edit_by_other_process_is_harmless", config_edit_by_other_process_is_harmless},
     {"error_messages", error_messages},

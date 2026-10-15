@@ -1,20 +1,21 @@
 # Movable locks instead of callbacks?
 
-Question: since every method on a lock still needs a runtime check, why not
-make the locks movable and drop the callbacks? And do the atomic lock
+**Status: adopted.** `cpp/` now uses movable `ChainLock`/`Session<K>` with
+atomic `hand_to`/`hand_back`. This page is the reasoning behind that
+decision; [`../DESIGN.md`](../DESIGN.md) §5-6 describe the result, and
+[`cpp/examples`](../../../cpp/examples) show it in use.
+
+The question was: since every method on a lock still needs a runtime check,
+why not make the locks movable and drop the callbacks? And do the atomic lock
 handoffs matter, or can we swap non-atomically?
 
-Short answer: **yes, make them movable, and keep the atomic handoffs.** They
+Answer: **yes, make them movable, and keep the atomic handoffs.** They
 don't conflict: an atomic handoff is the lock moving from one object into
-another, the way a `std::unique_lock` moves. The sketch in
-[`sketch.hpp`](sketch.hpp) shows the API. [`read_idcode.cpp`](read_idcode.cpp)
-and [`virtual_jtag.cpp`](virtual_jtag.cpp) are the same programs as in
-`cpp/examples/`, rewritten against it; both compile (declarations only) with
-g++-14 and clang-19.
+another, the way a `std::unique_lock` moves.
 
 ## 1. The checks are there either way
 
-| Runtime check on every method | Callbacks (now) | Movable (sketch) |
+| Runtime check on every method | Callbacks (before) | Movable (now) |
 |---|---|---|
 | "My lock is with an open right now" | `handed_away_`: the lambda can capture the `ChainLock` by reference and call it inside `with` | gone: `hand_to` empties the `ChainLock`, so this is the "empty" check below |
 | "I lost the lock" (a handback and the re-lock both failed) | `lost_` | the "empty" check |
@@ -89,42 +90,38 @@ So keep both. They aren't in tension once the lock is a movable object:
 One honest wrinkle: on failure, `hand_to` can't always say "the lock is
 still in `cl`". After a failure *after sending* nobody holds it
 (`jtag_client_open.cpp:544`), and the wrapper's re-lock may fail too. So the
-rule is "on failure, check `bool(cl)`" (sketch.hpp). The callback design has
+rule is "on failure, check `bool(cl)`" (DESIGN.md §6). The callback design has
 the same three outcomes, hidden behind `lost_`.
 
 ## 4. Side by side
 
-`cpp/examples/read_idcode.cpp` (callbacks) vs
-[`read_idcode.cpp`](read_idcode.cpp) (movable): the same steps, but the
-movable one is a plain function. It reads top to bottom, returns early with
-ordinary `return`, and the destruction order at the closing brace is the
-release order (`~Session` unlocks, `~Open` closes, `~ChainLock` is already
-empty).
+The callback versions of the examples are in git history (commit `646cc93`,
+`cpp/examples/`). Compared with the movable versions now in `cpp/examples/`:
+`read_idcode` becomes a plain function that reads top to bottom, returns
+early with ordinary `return`, and releases in destruction order (`~Session`
+unlocks, `~Open` closes, `~ChainLock` is already empty). `virtual_jtag` and
+`aji_list` gain helpers that borrow the caller's `ChainLock&`, hand the lock
+to a node or hub and back (`cl = std::move(*back)`), which the callback
+design couldn't express.
 
-`cpp/examples/virtual_jtag.cpp` vs [`virtual_jtag.cpp`](virtual_jtag.cpp):
-discovery stays with the caller's `ChainLock&`; `transfer` hands the lock to
-the node and back, `cl = std::move(*back)`. That flow can't be written with
-callbacks.
+## 5. What changed in `cpp/`
 
-## 5. What would change in `cpp/`
-
-- Remove: `SessionFactory`, `settle`/`settled_t`/`call_result_t`,
+- Removed: `SessionFactory`, `settle`/`settled_t`/`call_result_t`,
   `Handback`, `ChainLockResult`, `Chain::locked`, `Open::locked`,
   `ChainLock::with`, and the must-not-compile cases that test callback rules
   (4 of 12: `session_by_lvalue_ref`, `session_escapes`,
   `chain_lock_by_lvalue_ref`, `chain_lock_escapes`).
-- Add: move operations with an empty state; owner thread id + check;
+- Added: move operations with an empty state; owner thread id + check;
   `Chain::lock`, `Open::lock`, `ChainLock::unlock/hand_to`,
-  `Session::hand_back/hand_to/unlock`; `Errc::wrong_thread`; runtime tests
-  for use-after-move and the wrong thread (both possible without hardware:
-  the dummy chain can't be locked, but empty objects and thread checks can be
-  exercised directly).
+  `Session::hand_back/hand_to/unlock`; `Errc::empty_lock`, `wrong_thread`,
+  `not_from_chain`; a runtime test for empty objects (no hardware needed) and
+  checks for the thread rule and every handoff in `aji_idcode` (hardware).
 - Unchanged: values, errors, `Pending`, `SessionCore`'s scan bookkeeping, the
   management guard, `OpenState` deferral, the examples' logic.
 
 ## 6. Recommendation, ranked
 
-1. **Movable locks with atomic `hand_to`/`hand_back`** (the sketch). Same
+1. **Movable locks with atomic `hand_to`/`hand_back`** (chosen). Same
    runtime checks as now plus one thread check, much less machinery, and
    ordinary control flow; atomicity kept at no cost.
 2. Movable locks with only non-atomic swaps (`unlock` then `lock`). Slightly
