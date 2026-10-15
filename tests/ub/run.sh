@@ -34,7 +34,9 @@ if [[ "${1:-}" == "--rebuild" ]] || ! is_sanitized; then
     echo "== building libaji_client with $CXX and sanitizers"
     (
         cd "$repo"
-        [[ -x configure ]] || ./bootstrap
+        # bootstrap copies Makefile.am files into the safestringlib submodule;
+        # re-run it if the submodule has been reset since.
+        [[ -x configure && -f 3rdparties/safestringlib/Makefile.am ]] || ./bootstrap
         ./configure CC="$CC" CXX="$CXX" CFLAGS="$FLAGS" CXXFLAGS="$FLAGS" LDFLAGS="$SAN" >/dev/null 2>&1
         make clean >/dev/null 2>&1 || true
         make -j"$(nproc)" >/dev/null 2>&1
