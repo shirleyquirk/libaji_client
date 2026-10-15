@@ -124,5 +124,6 @@ version, and the cable type.
   `ChainLock` is lost and returns `Errc::lock_lost` (DESIGN.md §6).
 - **Library bugs left in place** (no patches): dotted IPv4 server addresses
   overflow a buffer inside the library; removing a temporary server is a
-  `new[]`/`delete` mismatch; `scan()` never passes timeout 0
+  `new[]`/`delete` mismatch; with `QUARTUS_JTAG_CLIENT_NO_LOCAL_SERVER` set and
+  no remote servers configured, `scan()` crashes inside the library
   (FINDINGS.md §4).

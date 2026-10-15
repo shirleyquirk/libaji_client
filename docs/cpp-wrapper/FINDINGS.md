@@ -387,7 +387,7 @@ All found by the same sanitizer build.
 |---|---|---|
 | Any server given as a dotted IPv4 address (`"192.168.1.5:1309"`) overflows a heap buffer on 64-bit Linux: 4 bytes are allocated, then an 8-byte `unsigned long` is stored into them. | `TCPCLIENT::lookup`, `jtag_tcpclient.cpp:126` and `:133` | `03_dotted_ip_overflow.cpp` |
 | A temporary server's info block is allocated with `new[]` and freed with `delete`. Removing any temporary remote server is UB. | `jtag_client_link.cpp:442` (allocated) / `:679` (freed) | `04_temp_server_delete_mismatch.cpp` |
-| With `QUARTUS_JTAG_CLIENT_NO_LOCAL_SERVER` set, `aji_get_hardware*` with timeout 0 and no chains found calls `local_server()->connected()` on `NULL`: segfault. | `jtag_client_chain.cpp:173` | none (narrow; found while writing test 05, which avoids timeout 0) |
+| With `QUARTUS_JTAG_CLIENT_NO_LOCAL_SERVER` set, any `aji_get_hardware*` that finds no valid chain calls `local_server()->connected()` on `NULL`: segfault. That happens with no remote servers configured (every call), or with timeout 0 before any server has been contacted. Without that variable the local server always exists, so normal setups can't hit it. | `jtag_client_chain.cpp:173` | none (seen while writing test 05 and the wrapper examples) |
 | The config parser calls `token(NULL, 0)`, which computes `NULL + 0 - 1`. UB, reported by UBSan on every config load with a key/value; harmless in practice. | `jtag_configuration_file.cpp:227` (call), `:275` (arithmetic) | shows up in the logs of tests 06 and others |
 
 Each is a few lines to fix. Upstream is archived and doesn't accept PRs, so

@@ -33,8 +33,10 @@ using namespace std::chrono_literals;
 // Servers still connecting after `timeout` show up as dummy entries; that is
 // not an error.
 //
-// A timeout of 0 is raised to 1 ms: with QUARTUS_JTAG_CLIENT_NO_LOCAL_SERVER
-// set, timeout 0 can crash the library (FINDINGS.md §4).
+// A timeout of 0 is raised to 1 ms. With QUARTUS_JTAG_CLIENT_NO_LOCAL_SERVER
+// set, the library crashes if it finds no chain at all (FINDINGS.md §4):
+// timeout 0 before any server was contacted is one way to get there; having
+// no remote servers configured is the other, and that one we can't avoid.
 expected<std::vector<Chain>> scan(std::chrono::milliseconds timeout = 2s);
 
 // scan(), then the one chain whose info matches `pred`.
