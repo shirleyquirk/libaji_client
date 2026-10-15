@@ -1,7 +1,13 @@
 # C++ RAII wrapper for `aji.h`: design plan
 
-Status: **proposal, waiting for sign-off. No wrapper code has been written yet.**
-Target: C++23 (deducing `this`, `std::expected`), gcc 14 / clang 18.
+Status: **implemented in [`cpp/`](../../cpp) (first cut); hardware testing pending.**
+Target: C++23. Builds with gcc 14 and clang 19. clang 18 can't: with
+libstdc++ it doesn't get `std::expected` (libstdc++ requires
+`__cpp_concepts >= 202002L`; clang 18 reports 201907L).
+
+Decisions taken (§9): full `expected`; management calls always return an
+error; no patches to the library; no fake jtagd: hardware testing is done
+by hand with [`cpp/examples`](../../cpp/examples).
 
 The library behaviour this plan relies on, with line references and sanitizer
 evidence, is in [`FINDINGS.md`](FINDINGS.md). Section numbers like "F§1.1"
@@ -18,7 +24,7 @@ point there.
 | D3 | The lock is passed to an open **within a scope**: `chain_lock.with(open, f)` | It mirrors the library's own usage (F§1.1) and makes the handoff back automatic. |
 | D4 | **One open type, templated on its kind**: `Open<K>` / `Session<K>`, `K ∈ {Tap, EntireChain, SldNode, SldHub}`, with operations gated by `requires` | The four kinds share most scan operations, with differences (F§1.2, and §2 below). |
 | D5 | `AJI_HARDWARE` is **discarded after copying**: `HardwareInfo` holds owned strings, and `Chain` holds the id plus a `HardwareInfo` **by value** | The strings and the id are library-owned and can be freed under us (F§2.1, F§2.2, F§2.4). |
-| D6 | **Free functions in `namespace aji`**, no `Registry` object. The functions that can make the library free chains ("management" functions) refuse to run while any `Chain`/`ChainLock`/`Open` is alive. | Those calls free chain objects, strings and server connections, including because *another process* edited `~/.jtag.conf` (F§2.4, tests 01, 05, 06). |
+| D6 | **Free functions in `namespace aji`**, no `Registry` object. The functions that can make the library free chains ("management" functions) refuse to run while any `Chain` or `Open` is alive (a `ChainLock` only exists inside `Chain::locked`, so its `Chain` covers it). | Those calls free chain objects, strings and server connections, including because *another process* edited `~/.jtag.conf` (F§2.4, tests 01, 05, 06). |
 | D7 | **Deferred scans return `Pending<T>`**, which can only be read after a successful flush | Results and errors arrive late; buffers aren't filled on error (F§3). |
 | D8 | Handing the lock back **can fail**, and the wrapper handles it (retry, then re-lock or mark the lock lost) | F§3.3. |
 
@@ -34,7 +40,7 @@ point there.
 | `TapInfo` | `AJI_DEVICE` fields (owned name) + `position` (the index `aji_read_device_chain` returns, which `open_device` takes). The direction is unclear: `aji.h:861-862` says index 0 is nearest TDI, but `jtag_client_open.h:233` says `m_position` 0 is near TDO. Open item O7. |
 | `SldNodeInfo` | `AJI_HIER_ID` + the `AJI_HUB_INFO` at the same index (`get_nodes` returns parallel arrays; `jtagconfig.cpp:540-555` sizes them together) |
 | `SldHubAddr` | `(SldNodeInfo, level)`. Hubs are never listed directly; a hub is "the level-L ancestor of node X" (`aji_open_hub`, `aji.h:2088`). Obtained with `node.hub(level)`. |
-| `ClaimSet` | a list of `AJI_CLAIM2`, with builders: `ClaimSet::tap({ir...})`, `ClaimSet::sld_node()`, `ClaimSet::sld_hub()` |
+| `ClaimSet` | a list of `AJI_CLAIM2`, built with `.add(ClaimType, value)` (one call per claim; `ClaimType` mirrors `AJI_CLAIM_TYPE`) |
 | `aji::Error` | `enum class` mirroring `AJI_ERROR`, plus wrapper-only errors (`lock_lost`, `stale_chain`), with a `std::error_category` |
 
 ### Handles
@@ -56,10 +62,10 @@ point there.
 | `SldHub` | `open_hub(pos, hub_addr, claims)` → `aji_open_hub` | same as `SldNode` |
 
 ```cpp
-enum class Kind { Tap, EntireChain, SldNode, SldHub };
+enum class Kind { tap, entire_chain, sld_node, sld_hub };
 
 template<Kind K>
-inline constexpr bool is_virtual = (K == Kind::SldNode || K == Kind::SldHub);
+inline constexpr bool is_virtual = (K == Kind::sld_node || K == Kind::sld_hub);
 
 template<Kind K>
 class Session {
@@ -68,7 +74,7 @@ public:
     Session& operator=(const Session&) = delete;   // implicitly no move either
 
     Pending<Bits>  dr(DrScan const&);
-    Pending<DWORD> ir(DWORD instruction)          requires (K == Kind::Tap);
+    Pending<DWORD> ir(DWORD instruction)          requires (K == Kind::tap);
     Pending<Bits>  ir(BitsView write)              requires (!is_virtual<K>);
     Pending<DWORD> overlay(DWORD value)            requires (is_virtual<K>);
     void           idle(DWORD clocks, RtiFlags = {});
@@ -145,7 +151,8 @@ std::string last_error_info();                   // aji_get_error_info
 ```
 
 `detail::Pin` is a process-wide atomic counter: incremented by the
-constructors of `Chain`, `ChainLock` and `Open<K>`, decremented by their
+constructors of `Chain` and `Open<K>` (a `ChainLock` lives inside its `Chain`'s
+`locked` call), decremented by their
 destructors. It isn't an object you have to create or pass around, so the API
 is plain free functions, as you asked. The state still exists, because the
 library keeps it globally (`AJI_CLIENT::m_link`); the counter only reflects it.
@@ -220,33 +227,35 @@ using namespace std::chrono_literals;
 auto blaster = aji::find([](const aji::HardwareInfo& h) {
     return h.hw_name.starts_with("USB-Blaster") && !h.server;
 });
-if (!blaster) return log_error(blaster.error());   // Error::no_devices / Error::ambiguous
+if (!blaster) return log_error(blaster.error());   // Errc::no_match / Errc::ambiguous_match
 
 // 3. Lock the chain inside a scope, read the TAPs, open what we need.
-auto hash = blaster->locked(10s, [&](aji::ChainLock& cl) -> aji::expected<Hash> {
-    AJI_TRY(taps,  cl.scan());                                // read_device_chain(auto_scan=true)
-    AJI_TRY(pos,   find_fpga(taps));
-    AJI_TRY(nodes, cl.nodes(pos));
-    AJI_TRY(hub,   cl.open_hub(pos, nodes.front().hub(0), aji::ClaimSet::sld_hub(), "app"));
-    return cl.with(hub, aji::Pack::Manual, [](auto s) {      // s: Session<Kind::SldHub>, see §5
-        s.overlay(HUB_IDENT);
-        return s.dr({.length = 4, .read = {0, 4}, .batch = 32});   // Pending<Bits>
-    });                       // lock handed back + batch flushed; Pending becomes a value or an Error
-});                           // hub closed (lock already back with the chain), chain unlocked
+auto hash = blaster->locked(10s, [&](auto cl) -> aji::expected<aji::Bits> {
+    auto taps = cl.taps();                                    // read_device_chain(auto_scan=true)
+    if (!taps) return aji::unexpected(taps.error());
+    auto nodes = cl.nodes(fpga_position(*taps));
+    if (!nodes || nodes->empty()) return aji::unexpected(aji::Error{aji::Errc::no_hubs, "example", {}});
+    auto hub = cl.open_hub(fpga_position(*taps), nodes->front().hub(0), ident_claims(), "app");
+    if (!hub) return aji::unexpected(hub.error());
+    return cl.with(*hub, aji::Pack::manual, [](auto s) {     // s: Session<Kind::sld_hub>, see §5
+        (void)s.overlay(HUB_IDENT);
+        return s.dr({.length = 4, .read_length = 4, .batch = 32});   // Pending<Bits>
+    });                       // batch flushed + lock handed back; the Pending becomes a value or an Error
+});                           // hub closed (the lock was already back with the chain), chain unlocked
 
 // 4. Management calls are refused while handles are alive, instead of being UB.
-auto again = aji::scan(2s);   // Error::chains_in_use while `blaster` exists
+auto again = aji::scan(2s);   // Errc::chains_in_use while `blaster` exists
 ```
 
-(`AJI_TRY` stands in for whatever early-return helper we pick for
-`expected`; see §9.)
+The complete version of this, including `ident_claims()` and the minor-version
+check, is [`cpp/examples/aji_list.cpp`](../../cpp/examples/aji_list.cpp).
 
 ---
 
 ## 4. Lifetimes enforced by structure
 
 ```
-aji::scan()/find() ──▶ Chain ──locked(f)──▶ ChainLock& ──open_*──▶ Open<K> (owned by caller code inside f)
+aji::scan()/find() ──▶ Chain ──locked(f)──▶ ChainLock (prvalue, inside f) ──open_*──▶ Open<K>
                                                     │
                                                     └──with(open, g)──▶ Session<K> (prvalue, inside g)
 ```
@@ -254,7 +263,7 @@ aji::scan()/find() ──▶ Chain ──locked(f)──▶ ChainLock& ──ope
 - `Session<K>` borrows `Open<K>&` and only exists inside `with`, so an `Open`
   is never destroyed while locked (F§1.2: `close_device` on a locked open
   leaks the connection mutex).
-- `Chain`, `ChainLock` and `Open<K>` each hold a pin, so no management call
+- `Chain` and `Open<K>` each hold a pin, so no management call
   can free the chain object or server connection they point into (§3.2).
 - `Open<K>` may outlive the `ChainLock` scope (`close_device` needs no chain
   lock, F§1.2).
@@ -299,6 +308,13 @@ Which lambda signatures work, checked with g++-14 and clang++ `-std=c++23`
 | `auto& s` / `Session<K>& s` | **no**: a prvalue doesn't bind to a non-const lvalue reference | — |
 | `return s;` from the lambda | **no**: needs the deleted move constructor | — |
 
+Implementation note: the return type can't be computed with
+`std::invoke_result_t<F, Session<K>>`. That passes an *xvalue*, which can't
+initialise a by-value parameter of a non-movable type, so `[](auto s)` would
+count as not invocable. The wrapper uses `decltype(f(prvalue<Session<K>>()))`,
+where `prvalue<T>()` is declared but never defined
+(`cpp/include/aji/session.hpp`). The compile tests caught this.
+
 On `auto s` vs `const auto s`: recommend **`auto s`**. Scan operations change
 library state (and the session's list of pending reads), so they're
 deliberately non-const. Making them `const` would let `const auto s` compile,
@@ -310,24 +326,22 @@ callback that only reads session info.
 ## 6. Handoff: scoped, and what happens when it fails
 
 ```cpp
+// Simplified from cpp/include/aji/chain_lock.hpp and session.hpp.
 template<Kind K, class F>
 auto ChainLock::with(Open<K>& open, Pack pack, F&& f)
-    -> expected<unwrap_pending_t<std::invoke_result_t<F, Session<K>>>>
+    -> expected<detail::settled_t<detail::call_result_t<F, Session<K>>>>
 {
-    assert(!handed_away_);                       // runtime guard: see "Limits" below
-    if (auto e = aji_unlock_chain_lock(id_, open.id(), to_c(pack)); e != AJI_NO_ERROR)
-        return unexpected(Error{e});             // nothing moved; we still hold the chain lock
-    handed_away_ = true;
+    if (auto e = hand_to(*open.state_, pack); !e)   // aji_unlock_chain_lock; see the first table row below
+        return unexpected(e.error());
+    Reset reset{*this};                              // clears handed_away_ on every exit, even on throw
 
-    Handback hb;
-    auto r = std::forward<F>(f)(Session<K>{open, pack, *this, hb});
-    // ~Session ran by the end of the line above, even if f threw (§5); it
-    // called aji_unlock_lock_chain and handled the outcomes below, recording
-    // them in hb.
-    handed_away_ = false;
-    if (hb.lock_lost) lost_ = true;
-    if (hb.error)     return unexpected(*hb.error);
-    return settle(std::move(r));                 // Pending<T> → T (its batch is now flushed)
+    Handback out;
+    auto r = f(Session<K>(open, pack, Release::to_chain, this, out));
+    // ~Session ran by the end of the line above (§5). It flushed the queue,
+    // called aji_unlock_lock_chain, handled the outcomes below, and wrote the
+    // session's first error, if any, into `out`.
+    if (out.error) return unexpected(*out.error);
+    return settle(std::move(r));                     // Pending<T> -> T (its batch has been flushed)
 }
 ```
 
@@ -336,13 +350,15 @@ auto ChainLock::with(Open<K>& open, Pack pack, F&& f)
 
 | Outcome | What the library state is | Wrapper action |
 |---|---|---|
-| `AJI_NO_ERROR` | chain locked | done |
-| a deferred error returned by the early return at `jtag_client_open.cpp:587-588` | **open still locked**, error cleared | record the error, **retry the handoff once** (the flag is now clear) |
-| error from `send_receive` (`:603-612`) | **nobody holds the lock** | record the error, then call `aji_lock_chain(id_, original_timeout)` to restore what `ChainLock` promises; if that fails, set `ChainLock` to *lost*: later operations return `Error::lock_lost` and the destructor skips `aji_unlock_chain` |
+| *Handing over* (`aji_unlock_chain_lock`) fails before sending | chain still locked | return the error |
+| *Handing over* fails after sending (`jtag_client_open.cpp:544`) | **nobody holds the lock** | return the error; re-lock as in the last row. `aji_lock_chain` returns `AJI_LOCKED` when we still hold the chain (`jtag_client_chain.cpp:829-830`), so one re-lock attempt tells the two cases apart |
+| *Handing back*: `AJI_NO_ERROR` | chain locked | done |
+| *Handing back*: a deferred error returned by the early return at `jtag_client_open.cpp:587-588` | **open still locked**, error cleared | record the error, **retry the handoff once** (the flag is now clear) |
+| *Handing back*: error from `send_receive` (`:603-612`) | **nobody holds the lock** | record the error, then call `aji_lock_chain(id_, original_timeout)` to restore what `ChainLock` promises; if that fails, set `ChainLock` to *lost*: later operations return `Errc::lock_lost` and the destructor skips `aji_unlock_chain` |
 
 The *lost* state is the one place where we can't avoid a runtime state flag.
 C++ can't make a type disappear when a library call fails.
-(This recovery policy is a proposal, open item O3.)
+(Policy O3: re-lock, then *lost*.)
 
 ### Limits of the scoped approach
 
@@ -359,15 +375,15 @@ Agreed. Two concrete cases:
    addresses inside `with(hub, …)`, return them, and recurse from the
    `ChainLock` scope. That's more code, but the library's own manual version
    gets it wrong.
-2. **Moving the lock directly between two opens** (`aji_unlock_lock`). Offered
-   as `Session<A>::switch_to(Open<B>&, g)`: `g` gets a prvalue `Session<B>`, and the
-   lock comes back to `A` when `g` returns. That's a nested scope; no new
-   concept is needed.
+2. **Moving the lock directly between two opens** (`aji_unlock_lock`). This
+   would be `Session<A>::switch_to(Open<B>&, g)`: `g` gets a prvalue
+   `Session<B>`, and the lock comes back to `A` when `g` returns. **Not in the
+   first cut**: you don't expect to need it, and its failure handling needs a
+   third set of recovery rules.
 
 What the scopes can't catch at compile time: the user's lambda can still
 capture the `ChainLock&` by reference and call it while the lock is with the
-open. The `handed_away_` flag turns that into an assertion (debug) or
-`Error::lock_lost` (release). C++ has no linear types, so this hole stays.
+open. The `handed_away_` flag turns that into `Errc::lock_handed_away`. C++ has no linear types, so this hole stays.
 
 If real code ever needs to move the lock back and forth a lot, the fallback is
 an explicit runtime state machine (`Baton` type with `holder()`), checked on
@@ -402,11 +418,11 @@ private:
   reports only the first error of a batch and fills no buffers after one
   (`jtag_client_open.cpp:2151-2157`). Which scan in the batch failed is
   unknown; the library tracks `m_checkpoint` internally but doesn't expose it.
-- With `Pack::Never`, and for reads with `Pack::Auto`, scans run immediately
+- With `Pack::never`, and for reads with `Pack::automatic`, scans run immediately
   (F§3.1 table). Then `Pending` is ready on return and `get()` costs nothing.
 
 **Optional, decision O4:** make the pack style a template parameter,
-`Session<K, Pack::Never>`. Then `dr()` returns `expected<Bits>` directly in
+`Session<K, Pack::never>`. Then `dr()` returns `expected<Bits>` directly in
 immediate mode and `Pending<Bits>` only in deferred mode. That catches "read
 before flush" at compile time instead of returning `Error::not_flushed`, at
 the cost of one more template parameter on every signature.
@@ -416,20 +432,37 @@ the cost of one more template parameter on every signature.
 ## 8. File layout
 
 ```
-include/aji/
-  error.hpp      Error, error_category, expected<T> alias
-  values.hpp     HardwareInfo, TapInfo, SldNodeInfo, SldHubAddr, ClaimSet, flag enums
-  aji.hpp        namespace-level management functions (scan, find, add_remote_server, ...)
-  chain.hpp      Chain, detail::Pin
-  chain_lock.hpp ChainLock
-  open.hpp       Kind, Open<K>
-  session.hpp    Session<K>, Pending<T>, DrScan
-  all.hpp        umbrella header
-src/cpp/         the non-template parts (management functions, error_category, ChainLock)
-tests/ub/        sanitizer demonstrations of the C API hazards (exists now)
-tests/design/    compile checks for API-shape claims (exists now)
-tests/wrapper/   wrapper tests (to come; needs O5 for the lock and deferred paths)
+cpp/
+  CMakeLists.txt            builds against the autotools-built ../src/jtag/.libs/libaji_client.so
+  README.md                 build, test, and what to run on hardware
+  include/aji/
+    aji.hpp                 umbrella header
+    error.hpp               Errc, Error, expected<T>
+    types.hpp               value types: HardwareInfo, TapInfo, SldNodeInfo, ClaimSet, Bits, DrScan, flags
+    management.hpp          scan, find*, add/remove hardware, remote servers, device database, on_output
+    chain.hpp               Chain
+    chain_lock.hpp          ChainLock
+    open.hpp                Open<K>
+    session.hpp             Kind, Session<K>, settle/call_result_t helpers
+    pending.hpp             Pending<T>
+    detail/                 Pin, OpenState, SessionCore, result slots, handle forward declarations
+  src/                      the non-template parts; the only files that include aji.h
+    c_api.hpp               aji.h + conversions + static_asserts that the mirrored types match
+  tests/
+    no_hardware.cpp         runtime tests against the real library (unreachable servers, no jtagd)
+    compile/api_shape.cpp   what must compile, and 12 FAIL_* cases that must not
+  examples/
+    aji_list.cpp            like jtagconfig: chains, TAPs, nodes, design hash
+    aji_idcode.cpp          self-checking IDCODE read through every lock path
+tests/ub/                   sanitizer demonstrations of the C API hazards
+tests/design/               compile checks for the Session-passing claims
 ```
+
+The public headers don't include `aji.h`. It needs build macros named
+`PORT`, `UNIX`, `LINUX`, `WINDOWS` and so on, and refuses to be included after any
+other header. Instead the headers forward-declare `AJI_CHAIN`/`AJI_OPEN`
+and mirror the few structs they need; `src/c_api.hpp` checks the mirrors
+with `static_assert`.
 
 Left out of the wrapper: every `AJI_CLAIM` (v1) overload, the 4-argument and
 5-argument `DWORD*` forms of `aji_get_nodes`, the two `aji_open_node`
@@ -439,15 +472,15 @@ overloads that take an `idcode`, `aji_get_hardware` (use `aji_get_hardware2`),
 
 ---
 
-## 9. Open items for sign-off
+## 9. Decisions
 
-| # | Question | My recommendation |
+| # | Question | Decision |
 |---|---|---|
-| O1 | Error style: `std::expected` everywhere, or exceptions with `expected` at the edges? | `expected`. Most JTAG failures (timeouts, `CHAIN_IN_USE`) are normal outcomes, not exceptional ones. |
-| O2 | A management call while handles are alive: an error (as written), or an assertion? | Error in release builds, assertion in debug builds. |
-| O3 | When the handoff back fails and nobody holds the lock: re-lock automatically (as written) or always mark the lock lost? | Re-lock with the original timeout. It keeps `ChainLock`'s promise in the common case. |
-| O4 | Pack style as a template parameter (§7)? | Yes, but only after the plain version works. |
-| O5 | Write a minimal fake jtagd for the lock and deferred-path tests (F§3.5)? | Yes. Without it, D7/D8 are untested apart from on real hardware. |
-| O6 | The library bugs (F§4): patch them in this repo, or work around them in the wrapper? | Patch. Upstream is archived and doesn't accept PRs, so this fork is where fixes live. Each is a few lines, and tests 03/04 already cover two of them. |
-| O8 | Protocol drift with Intel's jtagd (F§5)? | Nothing to do now. Add a `server_protocol_version()` query and a test against whatever jtagd we use, so a break shows up as one failing test rather than odd behaviour. |
-| O7 | Small facts to check on real hardware or against the server source: the TAP position direction (§2), and whether `access_ir` on a node/hub open is rejected. | Check before freezing the `requires` clauses. |
+| O1 | Error style | Full `std::expected`; no exceptions from the wrapper. |
+| O2 | A management call while handles are alive | Always `Errc::chains_in_use`; never an assertion. |
+| O3 | Handback fails and nobody holds the lock | Re-lock with the original timeout; if that fails, the `ChainLock` is *lost* (§6). |
+| O4 | Pack style as a template parameter (§7) | Later, once the plain version has been tested on hardware. |
+| O5 | Fake jtagd for lock/deferred-path tests | No. Tested by hand on hardware with `cpp/examples`. |
+| O6 | Library bugs (F§4) | No patches. The wrapper avoids timeout 0 in `scan`; the rest are documented where they bite (`management.hpp`). |
+| O7 | TAP position direction; `access_ir` on node/hub opens | To be checked on hardware. |
+| O8 | Protocol drift with jtagd (F§5) | Nothing for now. |

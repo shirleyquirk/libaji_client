@@ -43,3 +43,6 @@ libaji_client-*
 **/*.tar.gz
 **/*.tar.bz2
 **/*.tar
+
+## C++ wrapper builds
+cpp/build*/
