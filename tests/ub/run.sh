@@ -60,7 +60,8 @@ for src in "$here"/[0-9]*.cpp; do
     ASAN_OPTIONS="detect_leaks=0${extra:+:$extra}" UBSAN_OPTIONS=print_stacktrace=1 \
         timeout 60 "$exe" >"$log" 2>&1 || true
 
-    # Every EXPECT line must appear, in order.
+    # Every EXPECT line must appear, in order, each on a later line than the
+    # previous match (so two patterns on one log line don't both match).
     ok=1; from=1
     while IFS= read -r want; do
         n="$(tail -n +"$from" "$log" | grep -nF -m1 -- "$want" | cut -d: -f1 || true)"

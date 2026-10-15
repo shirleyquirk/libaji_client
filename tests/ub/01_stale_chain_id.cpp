@@ -12,7 +12,6 @@
 // real hardware to reproduce.
 //
 // EXPECT: AddressSanitizer: heap-use-after-free
-// EXPECT: #0 
 // EXPECT: in aji_print_hardware_name
 // ASAN_OPTIONS: alloc_dealloc_mismatch=0
 

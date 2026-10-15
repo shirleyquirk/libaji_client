@@ -4,13 +4,14 @@ These facts come from reading the client implementation in `src/jtag/`, not
 only `src/h/aji.h`. Where the two disagree, the code wins. Line numbers refer
 to commit `5d9c782` (the "Archiving Notice" commit on `main`).
 
-The three sections in the order the design depends on them:
+The sections, in the order the design depends on them:
 
 1. [Locking: one lock per server connection, tied to a thread](#1-locking)
 2. [Lifetimes: chain ids and hardware strings belong to the library](#2-lifetimes) (shown with ASan in `tests/ub/`)
 3. [Deferred execution: results and errors arrive later](#3-deferred-execution) ("point 4" in the first review)
 
-At the end: [library bugs found along the way](#4-library-bugs-found-along-the-way).
+At the end: [library bugs found along the way](#4-library-bugs-found-along-the-way)
+and [drift with Intel's jtagd](#5-drift-with-intels-jtagd).
 
 ---
 
@@ -168,6 +169,52 @@ validity depends on nobody re-enumerating (see `DESIGN.md` §3).
   `open_entire_device_chain` and destroyed by `close_device`. `close_device`
   runs `delete this` even when it returns an error (`jtag_client_open.cpp:679`).
   That's single ownership, so a move-only RAII type is the right fit.
+
+### 2.4 When the library frees chains, strings and server connections
+
+There are **no threads** in the client library (no `pthread_create` in
+`src/jtag/`), so everything below happens synchronously, inside one of the
+caller's own `aji_*` calls. The table lists every place that frees one of
+the objects a caller can hold a pointer into.
+
+| | What is freed | Code | Reached from |
+|---|---|---|---|
+| A | Chains the server no longer reports (cable unplugged) | `refresh_hardware`, `jtag_client_link.cpp:1446-1456` | `aji_get_hardware(2)` and both `aji_find_hardware` with timeout > 0 (`update_hardware`, `jtag_client_chain.cpp:133`, `:205`, `:414`), `aji_add_hardware` (`:757`), `aji_remove_hardware` (`:797`) |
+| B | Whole server connections and all their chains, when that server's `RemoteN` entry vanished from or changed in the config file | `update_servers`, `jtag_client_link.cpp:196-223` → `~AJI_CLIENT`, `:640-643` | everything that calls `update_servers`: `update_hardware` (as A), `local_server()` (`aji_add_hardware`; `aji_get_hardware*` when no chains are found, `jtag_client_chain.cpp:173`; `get_server_version_info`/`get_server_path`; `aji_enable_remote_clients`/`get_remote_clients_enabled` via `check_remote_clients_possible`, `jtag_client_link.cpp:466`, `:498`), `aji_add_remote_server` (`:341`-`:404`), `aji_define_device`/`undefine_device` (`:1647`), `aji_get_defined_devices` (`:1697`) |
+| C | A remote server's connection and chains | `remove_remote_server`, `jtag_client_link.cpp:657-704` | `aji_remove_hardware` on any chain of that server |
+| D | Only the strings of a chain that still exists, under the same id | `set_strings`, `jtag_client_chain.cpp:651-663`, called by `refresh_chain`, `jtag_client_link.cpp:1593-1599` | every rescan (as A), whenever any of the chain's names changed: a renamed cable, or a server going from "Connecting ..." to connected |
+
+What this means in practice:
+
+- **An unplugged cable on its own frees nothing.** The chain object is freed
+  at the next call in row A. Until then, calls on it fail with ordinary
+  errors.
+- **Row B can be triggered by another process.** The config file
+  (`$QUARTUS_JTAG_CLIENT_CONFIG`, default `~/.jtag.conf`,
+  `jtag_configuration_file.cpp:114-128`) is re-read whenever its mtime or
+  ctime changes (`:178-182`). It's the same file `jtagconfig` and the Quartus
+  Programmer edit. Someone running `jtagconfig --removeserver` makes our next
+  `aji_define_device`, say, free the chains we hold. Test
+  `06_config_edited_by_other_process.cpp` shows this: the chain is freed
+  inside `update_servers`, and the next use is a heap use-after-free.
+- **Row B ignores locks.** Row A skips deletion when it can't take that
+  connection's mutex (`m_destroy = mutex_claimed`,
+  `jtag_client_link.cpp:1387-1393`), so a chain we have locked survives row A
+  by accident. Row B takes no mutex at all.
+- **Row B leaves open devices dangling.** `~AJI_CLIENT` closes the socket but
+  doesn't call `disconnect()`, which is what invalidates the connection's open
+  devices (`AJI_OPEN_JS::invalidate`, `jtag_client_link.cpp:1301-1307`). Each
+  `AJI_OPEN_JS` keeps its `m_client` pointer (`jtag_client_open.h:232`) to
+  the freed connection. *From reading the code only; not demonstrated, because
+  it needs a server that grants a lock.*
+- **Row D means even a chain id that is still valid can have dangling
+  strings.** Test `05_strings_freed_by_plain_rescan.cpp`: same id before and
+  after, old `server` pointer freed.
+- **A quirk:** the deletion loop in row B never examines `m_link[0]`
+  (`for (it = end()-1; it != begin(); )`, `jtag_client_link.cpp:203`). In
+  normal use that slot is the local jtagd, so remote servers are all
+  examined. With `QUARTUS_JTAG_CLIENT_NO_LOCAL_SERVER`, the first remote
+  server is never removed this way.
 
 ---
 
@@ -334,12 +381,43 @@ an `ACCESS_DR` would let us turn §3.3-3.4 into tests. It's listed in
 
 ## 4. Library bugs found along the way
 
-Both are found by the same sanitizer build. Each has its own test.
+All found by the same sanitizer build.
 
 | Bug | Where | Test |
 |---|---|---|
 | Any server given as a dotted IPv4 address (`"192.168.1.5:1309"`) overflows a heap buffer on 64-bit Linux: 4 bytes are allocated, then an 8-byte `unsigned long` is stored into them. | `TCPCLIENT::lookup`, `jtag_tcpclient.cpp:126` and `:133` | `03_dotted_ip_overflow.cpp` |
 | A temporary server's info block is allocated with `new[]` and freed with `delete`. Removing any temporary remote server is UB. | `jtag_client_link.cpp:442` (allocated) / `:679` (freed) | `04_temp_server_delete_mismatch.cpp` |
+| With `QUARTUS_JTAG_CLIENT_NO_LOCAL_SERVER` set, `aji_get_hardware*` with timeout 0 and no chains found calls `local_server()->connected()` on `NULL`: segfault. | `jtag_client_chain.cpp:173` | none (narrow; found while writing test 05, which avoids timeout 0) |
+| The config parser calls `token(NULL, 0)`, which computes `NULL + 0 - 1`. UB, reported by UBSan on every config load with a key/value; harmless in practice. | `jtag_configuration_file.cpp:227` (call), `:275` (arithmetic) | shows up in the logs of tests 06 and others |
 
-Both are one-line fixes in the library. Whether we patch the library or work
-around the bugs in the wrapper is a decision still to make (`DESIGN.md` §9).
+Each is a few lines to fix. Upstream is archived and doesn't accept PRs, so
+fixes would live in this fork (`DESIGN.md` §9, O6).
+
+---
+
+## 5. Drift with Intel's jtagd
+
+Upstream (`intel/libaji_client`) is archived, so this client won't follow
+changes in jtagd. How exposed that leaves us, from the connection handshake
+(`AJI_CLIENT::continue_connect`, `jtag_client_link.cpp:1000-1075`):
+
+- **Protocol versions are negotiated.** The server announces its version.
+  The client sends `USE_PROTOCOL_VERSION min(server, 13)`
+  (`AJI_CURRENT_VERSION`, `jtag_message.h:86`; `jtag_client_link.cpp:1061-1068`).
+  A newer jtagd that still speaks version 13 works unchanged; the client
+  already branches on older versions (`version_ok(...)`,
+  `server_version >= 5`/`>= 11` in `jtag_client_open.cpp`).
+- **What would break it:**
+  - a jtagd that drops version 13 (connection state `BROKEN`);
+  - a change of signature string (`BADVERSION`, `:1008-1014`);
+  - authentication other than MD5 challenge/response (`authtype != 0` →
+    `AUTHFAIL`, `:1054-1055`).
+- **What we'd miss without breaking:** anything Intel adds above version 13,
+  such as new message types or hardware features.
+
+Speculation: Intel has kept jtagd backward-compatible across many Quartus
+releases, because old Quartus installs and third-party tools depend on it.
+So a silent break seems less likely than gradually missing new features. That
+is a guess, not something I've checked against jtagd releases. The cheap
+insurance is a single connection test against the jtagd version we actually
+use (`DESIGN.md` O8).
