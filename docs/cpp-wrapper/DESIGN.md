@@ -205,7 +205,7 @@ Registry ──borrows──▶ Chain ──locked(f)──▶ ChainLock& ──
 
 Yes. Binding a reference never needs a move constructor. `f(std::move(s))` is
 only a cast, and `f(Session{...})` binds a materialised temporary. Checked
-with g++-14 `-std=c++23`:
+with g++-14 `-std=c++23` (reproduce with `tests/design/run.sh`):
 
 ```cpp
 struct Session { /* copy and move constructors deleted */ ~Session(); };
