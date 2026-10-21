@@ -272,7 +272,7 @@ int AJI_CONFIGURATION_FILE::load(void)
 int AJI_CONFIGURATION_FILE::READER::token(char * buffer, unsigned int max)
 {
     char * ptr = buffer;
-    char * end = buffer + max - 1;
+    char * end = (buffer != NULL) ? buffer + max - 1 : NULL; // token(NULL, 0) only skips
     int c;
     
     do

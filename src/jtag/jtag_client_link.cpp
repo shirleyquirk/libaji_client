@@ -430,9 +430,10 @@ void AJI_CLIENT::add_temporary_server_internal(const char * server, const char *
     STRING_SERVER_MAP::iterator j = s_temporary_servers.find(server);
     if (j != s_temporary_servers.end())
     {
-        const char * server_prev = (*j).first;
+        // The key points into the same allocation as the AJI_SERVER_INFO; free that.
+        AJI_SERVER_INFO * info_prev = (*j).second;
         s_temporary_servers.erase(j);
-        delete (char *) server_prev;
+        delete[] (char *) info_prev;
     }
 
     size_t svlen = strnlen_s(server, HOSTNAME_BUFFER_SIZE) + 1;
@@ -445,8 +446,8 @@ void AJI_CLIENT::add_temporary_server_internal(const char * server, const char *
     char * password_dup = server_dup + svlen;
     strcpy_s(password_dup, pwlen, password);
 
-    info->m_server = server;
-    info->m_password = password;
+    info->m_server = server_dup;
+    info->m_password = password_dup;
     info->m_primary = primary;
 
     s_temporary_servers[server_dup] = info;
@@ -676,7 +677,7 @@ AJI_ERROR AJI_CLIENT::remove_remote_server(void)
             if (info->m_primary != NULL)
                 return AJI_NO_ERROR; // Can't remove secondary servers manually
             s_temporary_servers.erase(j);
-            delete (char *) info; // Delete memory for info, server & password
+            delete[] (char *) info; // Delete memory for info, server & password
         }
     }
 

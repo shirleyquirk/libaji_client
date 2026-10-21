@@ -1724,7 +1724,7 @@ bool AJI_CHAIN_JS::read_blocker_info(RXMESSAGE * rx)
             }
         }
 
-        delete s_error_info;
+        delete[] s_error_info;
         s_error_info = error_info;
         rx->set_string(nullptr, 0);
     }
@@ -1774,7 +1774,7 @@ void AJI_CHAIN_JS::clear_blocker_info()
 //
 //END_FUNCTION_HEADER//////////////////////////////////////////////////////////
 {
-    delete s_error_info;
+    delete[] s_error_info;
     s_error_info = NULL;
 }
 

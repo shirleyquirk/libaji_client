@@ -130,7 +130,10 @@ bool TCPCLIENT::lookup(const char * server, DWORD port)
         m_addr_len = 4;
         m_addr_count = 1;
 
-        * reinterpret_cast<unsigned long *>(m_addr) = addr;
+        // inet_addr() returns a 32-bit in_addr_t; unsigned long is 64 bits on LP64,
+        // so storing through an unsigned long* would overrun the 4-byte buffer.
+        const uint32_t addr32 = static_cast<uint32_t>(addr);
+        memcpy(m_addr, &addr32, sizeof(addr32));
     }
     else
     {
