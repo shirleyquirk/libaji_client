@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc14
+            flags: ""
+          - name: gcc14-asan-ubsan
+            flags: "-fsanitize=address,undefined -fno-omit-frame-pointer"
+          - name: gcc14-tsan
+            flags: "-fsanitize=thread"
+    env:
+      # libaji_client has no global teardown, so handles a test doesn't close
+      # are still allocated at exit; that's not what this job is looking for.
+      ASAN_OPTIONS: detect_leaks=0
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 cmake ninja-build
+
+      - name: Relax ASLR for TSan
+        if: matrix.name == 'gcc14-tsan'
+        # TSan in gcc 14 can't cope with the 32-bit mmap randomisation 24.04 runners use.
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14
+          -DCMAKE_C_FLAGS="${{ matrix.flags }}"
+          -DCMAKE_CXX_FLAGS="${{ matrix.flags }}"
+          -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.flags }}"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j4
