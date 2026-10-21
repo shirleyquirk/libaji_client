@@ -53,7 +53,7 @@ cables:
 TEST(Scenario, UnknownKeyIsAnErrorWithPosition)
 {
     EXPECT_EQ("board.yaml:4:9: unknown key 'irlength' in chain entry (expected one of: name, idcode, irlen, "
-              "idcode_ir, ir_capture, features, registers, hub, provenance)",
+              "idcode_ir, ir_capture, features, registers, channels, hub, provenance)",
               error_of("cables:\n  - chain:\n      - idcode: 1\n        irlength: 10\n"));
 }
 
@@ -123,6 +123,22 @@ TEST(Scenario, DescribeShowsProvenance)
               text.find("channel packets: command IR 0x1, response IR 0x2, 32-bit words, 1 transcript entries  "
                         "[placeholder]"))
         << text;
+}
+
+} // namespace
+
+namespace {
+
+TEST(Scenario, TapChannelCannotUseReservedIrs)
+{
+    EXPECT_NE(std::string::npos, error_of(R"(cables:
+  - chain:
+      - idcode: 1
+        irlen: 10
+        idcode_ir: 0x006
+        channels:
+          - { command_ir: 0x006, response_ir: 0x2B1 }
+)").find("reserved"));
 }
 
 } // namespace

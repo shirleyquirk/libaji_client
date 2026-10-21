@@ -184,14 +184,41 @@ private:
         return out;
     }
 
-    Channel channel(const YAML::Node & n, std::string_view node_name, std::uint32_t ir_bits) const
+    // Parse a `channels:` list for `owner` ("node 'x'" / "device 'x'"), rejecting
+    // IRs already taken by registers, other channels or `reserved`.
+    std::vector<Channel> channel_list(const YAML::Node & list, std::string_view owner, std::uint32_t ir_bits,
+                                      const std::map<std::uint32_t, RegisterSpec> & regs,
+                                      std::initializer_list<std::uint32_t> reserved = {}) const
+    {
+        if (!list.IsSequence())
+            fail(list, "channels must be a list");
+        std::vector<Channel> out;
+        for (const auto & c : list) {
+            Channel ch = channel(c, owner, ir_bits);
+            for (std::uint32_t ir : {ch.command_ir, ch.response_ir}) {
+                if (regs.contains(ir))
+                    fail(c, std::format("channel '{}' IR 0x{:X} is also declared as a register", ch.name, ir));
+                if (std::ranges::find(reserved, ir) != reserved.end())
+                    fail(c, std::format("channel '{}' IR 0x{:X} is reserved (IDCODE, BYPASS or hub USER0/USER1)",
+                                        ch.name, ir));
+                for (const Channel & other : out)
+                    if (ir == other.command_ir || ir == other.response_ir)
+                        fail(c, std::format("channel '{}' IR 0x{:X} is already used by channel '{}'", ch.name, ir,
+                                            other.name));
+            }
+            out.push_back(std::move(ch));
+        }
+        return out;
+    }
+
+    Channel channel(const YAML::Node & n, std::string_view owner, std::uint32_t ir_bits) const
     {
         expect_map(n, "channel",
                    {"name", "command_ir", "response_ir", "word_bits", "idle", "transcript", "provenance"});
         Channel c;
         c.name = n["name"] ? string(n["name"], "name") : "channel";
         if (!n["command_ir"] || !n["response_ir"])
-            fail(n, std::format("channel '{}' on node '{}' needs command_ir and response_ir", c.name, node_name));
+            fail(n, std::format("channel '{}' on {} needs command_ir and response_ir", c.name, owner));
         const std::uint64_t ir_max = (1ull << ir_bits) - 1;
         c.command_ir = u32(n["command_ir"], "command_ir", ir_max);
         c.response_ir = u32(n["response_ir"], "response_ir", ir_max);
@@ -233,22 +260,8 @@ private:
         out.idcode = node_idcode(n["idcode"]);
         if (n["registers"])
             out.registers = registers(n["registers"], std::format("node '{}'", out.name), ir_bits);
-        if (n["channels"]) {
-            if (!n["channels"].IsSequence())
-                fail(n["channels"], "channels must be a list");
-            for (const auto & c : n["channels"]) {
-                Channel ch = channel(c, out.name, ir_bits);
-                for (std::uint32_t ir : {ch.command_ir, ch.response_ir}) {
-                    if (out.registers.contains(ir))
-                        fail(c, std::format("channel '{}' IR 0x{:X} is also declared as a register", ch.name, ir));
-                    for (const Channel & other : out.channels)
-                        if (ir == other.command_ir || ir == other.response_ir)
-                            fail(c, std::format("channel '{}' IR 0x{:X} is already used by channel '{}'",
-                                                ch.name, ir, other.name));
-                }
-                out.channels.push_back(std::move(ch));
-            }
-        }
+        if (n["channels"])
+            out.channels = channel_list(n["channels"], std::format("node '{}'", out.name), ir_bits, out.registers);
         out.provenance = provenance(n["provenance"]);
         return out;
     }
@@ -286,7 +299,8 @@ private:
     Tap tap(const YAML::Node & n) const
     {
         expect_map(n, "chain entry",
-                   {"name", "idcode", "irlen", "idcode_ir", "ir_capture", "features", "registers", "hub", "provenance"});
+                   {"name", "idcode", "irlen", "idcode_ir", "ir_capture", "features", "registers", "channels", "hub",
+                    "provenance"});
         Tap t;
         if (n["name"])
             t.name = string(n["name"], "name");
@@ -321,6 +335,14 @@ private:
                 if (t.hub && (ir == user0_instruction || ir == user1_instruction))
                     fail(n["registers"], std::format("device '{}': IR 0x{:X} belongs to the hub", t.name, ir));
             }
+        }
+        if (n["channels"]) {
+            const std::uint32_t bypass = static_cast<std::uint32_t>(ir_max);
+            t.channels = t.hub ? channel_list(n["channels"], std::format("device '{}'", t.name), t.ir_length,
+                                              t.registers,
+                                              {t.idcode_instruction, bypass, user0_instruction, user1_instruction})
+                               : channel_list(n["channels"], std::format("device '{}'", t.name), t.ir_length,
+                                              t.registers, {t.idcode_instruction, bypass});
         }
         t.provenance = provenance(n["provenance"]);
         return t;
@@ -420,6 +442,12 @@ std::string describe(const Scenario & s)
 {
     std::string out = std::format("protocol v{}{}{}\n", s.version, s.password ? ", password required" : "",
                                   (s.server_flags & 1) ? ", remote clients allowed" : "");
+    auto channel_line = [](const Channel & ch) {
+        return std::format("      channel {}: command IR 0x{:X}, response IR 0x{:X}, {}-bit words, "
+                           "{} transcript entries{}\n",
+                           ch.name, ch.command_ir, ch.response_ir, ch.word_bits, ch.transcript.size(),
+                           with_provenance(ch.provenance));
+    };
     auto reg_line = [](std::uint32_t ir, const RegisterSpec & r) {
         std::string what;
         switch (r.kind) {
@@ -444,6 +472,8 @@ std::string describe(const Scenario & s)
                                with_provenance(t.provenance));
             for (const auto & [ir, r] : t.registers)
                 out += std::format("      {}\n", reg_line(ir, r));
+            for (const Channel & ch : t.channels)
+                out += channel_line(ch);
             if (!t.hub)
                 continue;
             for (const SldNode & n : t.hub->nodes) {
@@ -453,10 +483,7 @@ std::string describe(const Scenario & s)
                 for (const auto & [ir, r] : n.registers)
                     out += std::format("      {}\n", reg_line(ir, r));
                 for (const Channel & ch : n.channels)
-                    out += std::format("      channel {}: command IR 0x{:X}, response IR 0x{:X}, {}-bit words, "
-                                       "{} transcript entries{}\n",
-                                       ch.name, ch.command_ir, ch.response_ir, ch.word_bits, ch.transcript.size(),
-                                       with_provenance(ch.provenance));
+                    out += channel_line(ch);
             }
         }
     }

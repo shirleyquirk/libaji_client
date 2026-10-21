@@ -1,0 +1,19 @@
+# Same exchange as sdm_hello.yaml, but on the TAP's own IRs instead of
+# through a virtual-JTAG node: some packet services sit behind private
+# instructions. IR values and framing are PLACEHOLDERS.
+cables:
+  - hw_name: USB-BlasterII
+    port: "1-3"
+    chain:
+      - name: AGFB014R24A
+        idcode: 0x4341_A0DD
+        irlen: 10
+        provenance: placeholder
+        channels:
+          - name: packets
+            command_ir: 0x2B0
+            response_ir: 0x2B1
+            provenance: placeholder
+            transcript:
+              - request:  [0x0000_0010]
+                response: [0x0000_1000, 0x4341_A0DD]

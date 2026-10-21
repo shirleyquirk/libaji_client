@@ -82,3 +82,26 @@ TEST_F(RoundTrip, ConstRegisterOnNode)
 
 } // namespace
 } // namespace roundtrip
+
+namespace roundtrip {
+namespace {
+
+TEST_F(RoundTrip, TapLevelChannel)
+{
+    // Command/response on private TAP instructions rather than a hub node.
+    start("sdm_tap.yaml");
+    constexpr DWORD command_ir = 0x2B0, response_ir = 0x2B1;
+    AJI_OPEN_ID open = open_locked(0, {{AJI_CLAIM_IR_SHARED, 0, command_ir}, {AJI_CLAIM_IR_SHARED, 0, response_ir}});
+
+    const BYTE request[4] = {0x10, 0x00, 0x00, 0x00};
+    ASSERT_EQ(AJI_NO_ERROR, aji_access_ir(open, command_ir, nullptr));
+    ASSERT_EQ(AJI_NO_ERROR, aji_access_dr(open, 32, 0, 0, 32, request, 0, 0, nullptr));
+    BYTE response[8] = {};
+    ASSERT_EQ(AJI_NO_ERROR, aji_access_ir(open, response_ir, nullptr));
+    ASSERT_EQ(AJI_NO_ERROR, aji_access_dr(open, 64, 0, 0, 0, nullptr, 0, 64, response));
+    EXPECT_EQ(0x00001000u, le32(response));
+    EXPECT_EQ(0x4341A0DDu, le32(response + 4));
+}
+
+} // namespace
+} // namespace roundtrip

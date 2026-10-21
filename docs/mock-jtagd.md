@@ -51,6 +51,8 @@ cables:
         registers:              # TAP-level DRs by IR value; anything else is a free-length rw
           0x055: rw             # shorthand for { kind: rw }
           0x00F: { kind: const, length: 32, value: 0xCAFE_F00D }
+        channels:               # command/response on private TAP instructions (same keys as node channels)
+          - { name: priv, command_ir: 0x2B0, response_ir: 0x2B1, transcript: [] }
         hub:
           ir_bits: 8            # node IR width (USER1 = select bits + ir_bits)
           nodes:                # node select = position + 1
@@ -76,7 +78,8 @@ cables:
 | `const` | `value`, whatever was written |
 | `sequence` | `values` in order, then the last one forever |
 
-A channel matches the accumulated request words against its transcript. A
+A channel (on a hub node, or on the TAP's own IRs as in `scenarios/sdm_tap.yaml`)
+matches the accumulated request words against its transcript. A
 request that can't become any entry is a **model error**: the round-trip
 fixture fails the test on any model error left at teardown, so code can't
 quietly talk to hardware the scenario doesn't describe.

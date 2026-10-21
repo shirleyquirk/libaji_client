@@ -59,10 +59,12 @@ private:
         std::map<std::pair<std::size_t, std::size_t>, ChannelState> channels; // (node, channel)
     };
     // What a DR scan on `tap` currently reaches.
+    static constexpr std::size_t tap_level = static_cast<std::size_t>(-1); // node_index for TAP channels
+
     struct Target {
         const RegisterSpec * reg = nullptr;
         const SldNode * node = nullptr;
-        std::size_t node_index = 0;
+        std::size_t node_index = tap_level;
         const Channel * channel = nullptr;
         std::size_t channel_index = 0;
         bool command = false;        // channel command (true) or response (false) side

@@ -56,16 +56,74 @@ locking, timeouts.
 Nested hubs are accepted by the schema design but rejected by the loader until
 the server models bridges.
 
+## Capture: a logical-scan proxy, not pcap
+
+A packet capture loses the structure: the same logical operation looks
+different depending on how the client batched it (IR+DR in one packet vs two
+round trips, MANUAL vs NEVER packing, how FIFO data is chunked). So capture
+happens above batching:
+
+```
+your code ── libaji ──▶ jtag-proxy ──▶ real jtagd ──▶ cable ──▶ board
+                            │
+                            ├─ wire log: every block and FIFO payload, both directions
+                            └─ scan log: one line per logical IR/DR scan
+```
+
+`jtag-proxy` is a fake jtagd that forwards to the real one. It decodes both
+directions with the mock's protocol code and tracks what the server tracks:
+open id → TAP or node, the USER1 selection (node + virtual IR) per TAP, and
+the current IR. Each DR scan is then logged by name, with its write and read
+data:
+
+```
+sdm (tap 1, node 0x7A) IR 0x1: wrote 32b 00000010
+sdm (tap 1, node 0x7A) IR 0x2: read  64b 4341A0DD_00001000
+```
+
+Batching is undone before logging, so equivalent client behaviour gives an
+identical scan log. A second step turns scan logs into scenario YAML:
+consecutive command-IR writes become a transcript request, the following
+response-IR reads become its response, with `provenance: observed`. The
+wire log is kept for the protocol-level open questions. Blind spot:
+`ANY_SEQUENCE` carries raw TMS/TDI, which can't be mapped to logical scans
+without simulating the TAP state machine, so it is logged raw only.
+
+## Validation checklist
+
+What would move each layer from "self-consistent" to "evidence":
+
+1. **Dual-target tests.** Let the round-trip fixture point at a real jtagd
+   (`MOCK_JTAGD_TARGET=host:port` plus a board scenario) and run the existing
+   hardware/device/hub tests on a real board. Every test that passes on both
+   is direct evidence the mock matches jtagd at the AJI level. Cheapest, and
+   the highest value.
+2. **jtagconfig dumps → scenario importer**, then `mock-jtagd --check` and
+   real `jtagconfig -n` should print the same topology for the same board.
+3. **jtag-proxy wire log** settles the protocol unknowns, each provoked on purpose:
+   - batch error behaviour: does jtagd stop at the first failing command,
+     and what does it answer a following `CONTINUE_COMMANDS` with;
+   - claim conflict rules (exclusive vs shared vs weak, overlays);
+   - the error for an unknown `GET_PARAMETER` name; behaviour after a bad password;
+   - whether chain ids and open ids really live in disjoint ranges.
+4. **JTAG-to-Avalon master**: its packet protocol is public, so it can be a
+   real model rather than a transcript. A memory-pattern write/read-back test
+   that passes against both the mock and a board with on-chip RAM validates
+   the model and your J2A code together.
+5. **SDM packet service**: capture a real exchange with jtag-proxy, replace
+   the placeholder transcript in `sdm_hello.yaml` / `sdm_tap.yaml`, and mark
+   it `observed`.
+
 ## Plan
 
-1. YAML scenario loader, register kinds, transcript channels, `--check`.
-   *(this change)*
+1. YAML scenario loader, register kinds, transcript channels (on hub nodes
+   and on TAP IRs), `--check`. *(done)*
 2. Hello world: find the node by IDCODE fields, drive its virtual IR, run one
    command/response exchange (SDM-style GET_IDCODE, placeholder transcript).
-   *(this change)*
-3. `mock_jtagd::gtest` fixture library + CMake package for external projects;
-   a toy wrapper as the worked example.
-4. `jtagconfig` importer (needs real dumps).
-5. Capture tooling: record USER0/USER1 exchanges against a real jtagd and emit
-   transcript YAML. This closes the evidence loop for packet services.
-6. Named-node log matchers; callbacks; JTAG-to-Avalon and nested hubs as needed.
+   *(done)*
+3. Dual-target fixture (checklist 1).
+4. jtag-proxy: wire log + scan log, then the scan-log → YAML converter.
+5. `jtagconfig` importer (needs real dumps).
+6. `mock_jtagd::gtest` fixture library + CMake package for external projects.
+7. JTAG-to-Avalon master model.
+8. Named-node log matchers; callbacks; nested hubs as needed.

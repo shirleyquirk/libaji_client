@@ -93,6 +93,15 @@ ChainModel::Target ChainModel::target(std::size_t tap) const
     }
     if (t.hub && s.ir == user1_instruction)
         return out;
+    for (std::size_t i = 0; i < t.channels.size(); ++i) {
+        const Channel & ch = t.channels[i];
+        if (s.ir == ch.command_ir || s.ir == ch.response_ir) {
+            out.channel = &ch;
+            out.channel_index = i;
+            out.command = s.ir == ch.command_ir;
+            return out;
+        }
+    }
     if (auto it = t.registers.find(s.ir); it != t.registers.end())
         out.reg = &it->second;
     return out;
@@ -183,7 +192,8 @@ Bits ChainModel::capture(std::size_t tap, std::size_t length)
 void ChainModel::channel_receive(std::size_t tap, const Target & tg, const Bits & value)
 {
     const Channel & ch = *tg.channel;
-    const std::string where = std::format("node '{}' channel '{}'", tg.node->name, ch.name);
+    const std::string where = tg.node ? std::format("node '{}' channel '{}'", tg.node->name, ch.name)
+                                      : std::format("device '{}' channel '{}'", taps_[tap].name, ch.name);
     if (value.size() % ch.word_bits != 0) {
         errors_.push_back(std::format("{}: command scan of {} bits is not a whole number of {}-bit words",
                                       where, value.size(), ch.word_bits));

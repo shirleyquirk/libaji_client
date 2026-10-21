@@ -101,6 +101,7 @@ struct Tap {
     std::uint32_t idcode_instruction = 0x6;  // TLR selects this instruction
     std::uint32_t ir_capture = 0x1;          // value returned by IR capture ('b..01)
     std::map<std::uint32_t, RegisterSpec> registers; // keyed by IR value; others are rw
+    std::vector<Channel> channels;           // command/response pairs on the TAP's own IRs
     std::optional<SldHub> hub;               // answers USER1/USER0 when present
     std::string provenance;
 };
