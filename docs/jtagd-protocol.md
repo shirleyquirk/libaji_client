@@ -2,12 +2,12 @@
 
 Reconstructed from the client side in `libaji_client` (`src/jtag/jtag_message.h`,
 `jtag_tcplink.cpp`, `jtag_client_link.cpp`, `jtag_client_chain.cpp`,
-`jtag_client_open.cpp`). No server-side source exists in either repo: the
-`streaming/` code in this repo is *etherlink*, the ST-debug transport server,
-which is a different protocol on a different port. Everything below is what a
-server must do for the reference client to be happy. Items marked
-**[inferred]** are not visible in client code and need confirming against a
-real jtagd (see "Validation" at the end).
+`jtag_client_open.cpp`). No server-side source is public. Everything below is
+what a server must do for the reference client to be happy, and
+`test/mock_jtagd` implements it (see `docs/mock-jtagd.md`). Items marked
+**[inferred]** are not visible in client code; the mock picks a plausible
+behaviour for each, but they need confirming against a real jtagd (see
+"Validation" at the end).
 
 All integers are **big-endian**. `int` = u32, `long` = u64.
 
@@ -141,6 +141,12 @@ cheap robustness test.
 protocol version. `chain_id` is the server's handle for a cable;
 `open_id` is the server's handle for an opened device.
 
+These are **not** the `AJI_CHAIN_ID` / `AJI_OPEN_ID` of the C API. Those are
+pointers to client-side objects (`AJI_CHAIN_JS`, `AJI_OPEN_JS`), and each object
+stores the wire id (`m_chain_id`, `m_open_id`) the server handed out. The
+pointer never crosses the wire; the u32 never reaches the API caller (except
+folded into `AJI_HARDWARE.persistent_id`).
+
 ### Server / hardware
 
 | cmd | → | ← |
@@ -210,7 +216,29 @@ Blocker info: `int k`, then k × { str app_name, int (ip_ver<<16 | addrlen), raw
 
 Bit order in all bit buffers: LSB of byte 0 is the first bit shifted (nearest TDO).
 
-## 8. What a mock does *not* get to skip
+## 8. Client behaviours worth knowing
+
+Found by round-tripping the reference client against the mock:
+
+* **Deferred results.** With `AJI_PACK_AUTO/MANUAL/STREAM`, claimed commands
+  are batched and their outputs (`captured_ir`, DR read buffers) are only
+  written at `aji_flush()` or the next non-deferred call.
+* **`aji_unlock_chain_lock(..., AJI_PACK_STREAM)` never streams.** It stores
+  the pack style verbatim, whereas `aji_lock()` turns STREAM into "MANUAL +
+  pipelined `CONTINUE_COMMANDS`". Only locks taken via `aji_lock` stream.
+* **Server-qualified hardware names.** With `ReplaceLocalJtagServer` (or any
+  remote), cables belong to server `"host:port"`, so `aji_find_hardware` needs
+  `"USB-Blaster on host:port [USB-1]"` (what `aji_print_hardware_name`
+  prints), not `"USB-Blaster [USB-1]"`.
+* **Errors stop the batch.** The client stops reading response blocks at the
+  first error and leaves the device lock held, so the same open can carry on.
+* **Upstream bugs fixed on this branch** (each crashed or tripped ASan in a
+  round-trip test): 8-byte store into a 4-byte buffer for numeric-IP hosts
+  (`TCPCLIENT::lookup`); `new[]`/`delete` mismatch on blocker info; freeing an
+  interior pointer and keeping the caller's password pointer when a temporary
+  remote server is added twice; null-pointer arithmetic in the config reader.
+
+## 9. What a mock does *not* get to skip
 
 The client does SLD hub/node discovery (`aji_get_nodes`) entirely in client
 code by driving `ACCESS_IR(USER1)`, `ACCESS_DR(64-bit HUB_INFO overlay)`,
@@ -219,7 +247,7 @@ under test calls `aji_get_nodes`/`aji_open_node`, the mock must return a
 plausible SLD hub nibble stream on USER0 after that sequence. Pure
 "answer every DR with zeros" will make node discovery report no hub.
 
-## 9. Validation
+## 10. Validation
 
 Every **[inferred]** item, and ideally the whole table, should be checked by
 capturing traffic between `jtagconfig` (or `libaji_client`) and a real
