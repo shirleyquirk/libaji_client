@@ -20,7 +20,7 @@ Scenario Scenario::default_board()
     fpga.idcode_instruction = 0x006;
     fpga.hub = SldHub{
         .ir_bits = 8,
-        .nodes = {sld_node_idcode(6, 0x00, mfg_altera, 0), sld_node_idcode(1, 0x08, mfg_altera, 1)},
+        .nodes = {{sld_node_idcode(6, 0x00, mfg_altera, 0), "node0"}, {sld_node_idcode(1, 0x08, mfg_altera, 1), "node1"}},
     };
 
     Cable cable;

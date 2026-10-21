@@ -5,6 +5,7 @@
 #pragma once
 
 #include "aji.h"
+#include "mock_jtagd/scenario_yaml.hpp"
 #include "mock_jtagd/server.hpp"
 
 #include <gtest/gtest.h>
@@ -59,10 +60,21 @@ protected:
         ::setenv("QUARTUS_JTAG_CLIENT_CONFIG", config_path_.c_str(), 1);
     }
 
+    // Same, with the hardware described by a YAML file in test/scenarios/.
+    void start(const std::string & scenario_name)
+    {
+        start(load_scenario(std::filesystem::path(MOCK_JTAGD_SCENARIO_DIR) / scenario_name));
+    }
+
     void TearDown() override
     {
-        if (server_)
+        if (server_) {
+            // Anything left here means the code talked to hardware the scenario
+            // doesn't describe (e.g. a request no transcript entry matches).
+            for (const auto & e : server_->take_model_errors())
+                ADD_FAILURE() << "mock model error: " << e;
             server_->stop();
+        }
         if (!config_path_.empty())
             std::filesystem::remove(config_path_);
     }

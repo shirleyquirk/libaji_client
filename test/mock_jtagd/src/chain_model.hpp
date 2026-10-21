@@ -7,7 +7,10 @@
 #include "mock_jtagd/scenario.hpp"
 
 #include <cstdint>
+#include <deque>
 #include <map>
+#include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -31,28 +34,53 @@ public:
     void test_logic_reset();
     std::uint32_t instruction(std::size_t tap) const { return state_.at(tap).ir; }
 
+    // Behaviour violations (e.g. a request no transcript entry matches),
+    // drained by the server so tests can fail on them.
+    std::vector<std::string> take_errors() { return std::exchange(errors_, {}); }
+
 private:
+    // Data register currently selected on a TAP: (instruction, hub select, node ir).
+    using RegKey = std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>;
+
     struct HubState {
         std::uint32_t select = 0;   // 0 = hub itself, n = node n-1
         std::uint32_t node_ir = 0;  // 0 with select 0 = HUB_INFO
         std::size_t rom_pos = 0;
     };
+    struct ChannelState {
+        std::vector<std::uint64_t> request;   // words received so far
+        std::deque<std::uint64_t> response;   // words waiting to be read
+    };
     struct TapState {
         std::uint32_t ir = 0;
         HubState hub;
-        // Plain read/write data registers, keyed by (instruction, hub select, node ir).
-        std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>, Bits> regs;
+        std::map<RegKey, Bits> regs;               // rw contents
+        std::map<RegKey, std::size_t> seq_pos;     // sequence progress
+        std::map<std::pair<std::size_t, std::size_t>, ChannelState> channels; // (node, channel)
+    };
+    // What a DR scan on `tap` currently reaches.
+    struct Target {
+        const RegisterSpec * reg = nullptr;
+        const SldNode * node = nullptr;
+        std::size_t node_index = 0;
+        const Channel * channel = nullptr;
+        std::size_t channel_index = 0;
+        bool command = false;        // channel command (true) or response (false) side
     };
 
+    Target target(std::size_t tap) const;
     // Register length for the current instruction; 0 means "whatever is scanned".
     std::size_t dr_length(std::size_t tap) const;
     Bits capture(std::size_t tap, std::size_t length);
     void update(std::size_t tap, const Bits & value);
+    void channel_receive(std::size_t tap, const Target & t, const Bits & value);
     std::vector<std::uint32_t> hub_rom(const SldHub & hub) const;
     bool is_bypass(std::size_t tap) const;
+    RegKey key(std::size_t tap) const;
 
     std::vector<Tap> taps_;
     std::vector<TapState> state_;
+    std::vector<std::string> errors_;
 };
 
 // Shift `in` through a register currently holding `captured`; returns TDO bits

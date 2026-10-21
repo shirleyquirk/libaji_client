@@ -1,10 +1,12 @@
 // mock-jtagd: run the mock JTAG server as a standalone process.
+#include "mock_jtagd/scenario_yaml.hpp"
 #include "mock_jtagd/server.hpp"
 
 #include <csignal>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <print>
 #include <string>
 #include <string_view>
@@ -14,9 +16,11 @@ namespace {
 void usage(const char * argv0)
 {
     std::println(stderr,
-                 "Usage: {} [--port N] [--bind ADDR] [--protocol-version V] [--password PW]\n"
-                 "          [--allow-remote] [--port-file FILE] [--trace]\n"
-                 "Serves Scenario::default_board() until SIGINT/SIGTERM. --port 0 (default)\n"
+                 "Usage: {} [--scenario FILE.yaml [--check]] [--port N] [--bind ADDR]\n"
+                 "          [--protocol-version V] [--password PW] [--allow-remote]\n"
+                 "          [--port-file FILE] [--trace]\n"
+                 "Serves the scenario (default: a built-in demo board) until SIGINT/SIGTERM.\n"
+                 "--check validates the scenario, prints it and exits. --port 0 (default)\n"
                  "picks a free port; --port-file writes it out for test harnesses.",
                  argv0);
 }
@@ -28,6 +32,11 @@ int main(int argc, char ** argv)
     mock_jtagd::Scenario scenario = mock_jtagd::Scenario::default_board();
     mock_jtagd::ServerOptions options;
     std::string port_file;
+    std::string scenario_file;
+    bool check = false;
+    std::optional<std::uint32_t> version;
+    std::optional<std::string> password;
+    bool allow_remote = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
@@ -42,12 +51,16 @@ int main(int argc, char ** argv)
             options.port = static_cast<std::uint16_t>(std::stoul(value()));
         else if (arg == "--bind")
             options.bind_address = value();
+        else if (arg == "--scenario")
+            scenario_file = value();
+        else if (arg == "--check")
+            check = true;
         else if (arg == "--protocol-version")
-            scenario.version = static_cast<std::uint32_t>(std::stoul(value()));
+            version = static_cast<std::uint32_t>(std::stoul(value()));
         else if (arg == "--password")
-            scenario.password = value();
+            password = value();
         else if (arg == "--allow-remote")
-            scenario.server_flags |= 1;
+            allow_remote = true;
         else if (arg == "--port-file")
             port_file = value();
         else if (arg == "--trace")
@@ -56,6 +69,26 @@ int main(int argc, char ** argv)
             usage(argv[0]);
             return arg == "--help" || arg == "-h" ? 0 : 2;
         }
+    }
+
+    if (!scenario_file.empty()) {
+        try {
+            scenario = mock_jtagd::load_scenario(scenario_file);
+        } catch (const mock_jtagd::ScenarioError & e) {
+            std::println(stderr, "{}", e.what());
+            return 1;
+        }
+    }
+    // Command-line settings override the scenario file.
+    if (version)
+        scenario.version = *version;
+    if (password)
+        scenario.password = password;
+    if (allow_remote)
+        scenario.server_flags |= 1;
+    if (check) {
+        std::print("{}", mock_jtagd::describe(scenario));
+        return 0;
     }
 
     sigset_t sigs;

@@ -52,6 +52,11 @@ public:
     std::vector<CommandRecord> commands() const;
     unsigned connections() const;
 
+    // Scenario behaviour violations since the last call, e.g. a channel request
+    // with no transcript entry. A test that leaves any of these behind has
+    // talked to hardware the scenario doesn't describe.
+    std::vector<std::string> take_model_errors();
+
     // Chain id the client sees for scenario cable `index` (they are 1-based).
     static std::uint32_t chain_id(std::size_t index) { return static_cast<std::uint32_t>(index + 1); }
 

@@ -1,6 +1,8 @@
 #include "chain_model.hpp"
 
+#include <algorithm>
 #include <bit>
+#include <format>
 #include <optional>
 #include <tuple>
 
@@ -44,6 +46,7 @@ void ChainModel::test_logic_reset()
     for (std::size_t i = 0; i < taps_.size(); ++i) {
         state_[i].ir = taps_[i].idcode_instruction;
         state_[i].hub = {};
+        state_[i].seq_pos.clear();
     }
 }
 
@@ -59,6 +62,42 @@ std::uint32_t ChainModel::scan_ir(std::size_t tap, std::uint32_t instruction)
     return taps_[tap].ir_capture;
 }
 
+ChainModel::RegKey ChainModel::key(std::size_t tap) const
+{
+    const TapState & s = state_[tap];
+    return {s.ir, s.hub.select, s.hub.node_ir};
+}
+
+ChainModel::Target ChainModel::target(std::size_t tap) const
+{
+    const Tap & t = taps_[tap];
+    const TapState & s = state_[tap];
+    Target out;
+    if (t.hub && s.ir == user0_instruction) {
+        if (s.hub.select == 0 || s.hub.select > t.hub->nodes.size())
+            return out;
+        out.node_index = s.hub.select - 1;
+        out.node = &t.hub->nodes[out.node_index];
+        for (std::size_t i = 0; i < out.node->channels.size(); ++i) {
+            const Channel & ch = out.node->channels[i];
+            if (s.hub.node_ir == ch.command_ir || s.hub.node_ir == ch.response_ir) {
+                out.channel = &ch;
+                out.channel_index = i;
+                out.command = s.hub.node_ir == ch.command_ir;
+                return out;
+            }
+        }
+        if (auto it = out.node->registers.find(s.hub.node_ir); it != out.node->registers.end())
+            out.reg = &it->second;
+        return out;
+    }
+    if (t.hub && s.ir == user1_instruction)
+        return out;
+    if (auto it = t.registers.find(s.ir); it != t.registers.end())
+        out.reg = &it->second;
+    return out;
+}
+
 std::size_t ChainModel::dr_length(std::size_t tap) const
 {
     const Tap & t = taps_[tap];
@@ -71,13 +110,16 @@ std::size_t ChainModel::dr_length(std::size_t tap) const
         return t.hub->select_bits() + t.hub->ir_bits;
     if (t.hub && s.ir == user0_instruction && s.hub.select == 0 && s.hub.node_ir == 0)
         return 4;
+    if (const Target tg = target(tap); tg.reg)
+        return tg.reg->length;
     return 0;
 }
 
 std::vector<std::uint32_t> ChainModel::hub_rom(const SldHub & hub) const
 {
     std::vector<std::uint32_t> words{hub.idcode()};
-    words.insert(words.end(), hub.nodes.begin(), hub.nodes.end());
+    for (const SldNode & n : hub.nodes)
+        words.push_back(n.idcode);
     std::vector<std::uint32_t> nibbles;
     for (std::uint32_t w : words)
         for (int i = 0; i < 8; ++i)
@@ -104,10 +146,70 @@ Bits ChainModel::capture(std::size_t tap, std::size_t length)
         ++s.hub.rom_pos;
         return Bits::from_u64(nibble, 4);
     }
-    const auto key = std::tuple{s.ir, s.hub.select, s.hub.node_ir};
-    Bits reg = s.regs.contains(key) ? s.regs[key] : Bits();
+
+    const Target tg = target(tap);
+    if (tg.channel && !tg.command) {
+        // Response side: present as many queued words as the scan has room for.
+        auto & q = s.channels[{tg.node_index, tg.channel_index}].response;
+        const std::size_t w = tg.channel->word_bits;
+        Bits out;
+        for (std::size_t i = 0; i < length / w; ++i) {
+            std::uint64_t word = tg.channel->idle;
+            if (!q.empty()) {
+                word = q.front();
+                q.pop_front();
+            }
+            out.append(Bits::from_u64(word, w));
+        }
+        out.resize(length);
+        return out;
+    }
+    if (tg.channel)
+        return Bits(length);
+    if (tg.reg && tg.reg->kind == RegisterSpec::Kind::constant)
+        return Bits::from_u64(tg.reg->value, length);
+    if (tg.reg && tg.reg->kind == RegisterSpec::Kind::sequence) {
+        std::size_t & pos = s.seq_pos[key(tap)];
+        const std::uint64_t v = tg.reg->values[std::min(pos, tg.reg->values.size() - 1)];
+        ++pos;
+        return Bits::from_u64(v, length);
+    }
+    auto it = s.regs.find(key(tap));
+    Bits reg = it != s.regs.end() ? it->second : Bits::from_u64(tg.reg ? tg.reg->value : 0, length);
     reg.resize(length);
     return reg;
+}
+
+void ChainModel::channel_receive(std::size_t tap, const Target & tg, const Bits & value)
+{
+    const Channel & ch = *tg.channel;
+    const std::string where = std::format("node '{}' channel '{}'", tg.node->name, ch.name);
+    if (value.size() % ch.word_bits != 0) {
+        errors_.push_back(std::format("{}: command scan of {} bits is not a whole number of {}-bit words",
+                                      where, value.size(), ch.word_bits));
+        return;
+    }
+    ChannelState & cs = state_[tap].channels[{tg.node_index, tg.channel_index}];
+    for (std::size_t off = 0; off < value.size(); off += ch.word_bits)
+        cs.request.push_back(value.slice(off, ch.word_bits).to_u64());
+
+    for (const Exchange & ex : ch.transcript)
+        if (ex.request == cs.request) {
+            cs.response.insert(cs.response.end(), ex.response.begin(), ex.response.end());
+            cs.request.clear();
+            return;
+        }
+    const bool prefix_of_some = std::ranges::any_of(ch.transcript, [&](const Exchange & ex) {
+        return ex.request.size() > cs.request.size() &&
+               std::equal(cs.request.begin(), cs.request.end(), ex.request.begin());
+    });
+    if (!prefix_of_some) {
+        std::string words;
+        for (std::uint64_t w : cs.request)
+            words += std::format("{}0x{:0{}X}", words.empty() ? "" : ", ", w, (ch.word_bits + 3) / 4);
+        errors_.push_back(std::format("{}: no transcript entry for request [{}]", where, words));
+        cs.request.clear();
+    }
 }
 
 void ChainModel::update(std::size_t tap, const Bits & value)
@@ -126,7 +228,15 @@ void ChainModel::update(std::size_t tap, const Bits & value)
     }
     if (t.hub && s.ir == user0_instruction && s.hub.select == 0 && s.hub.node_ir == 0)
         return;
-    s.regs[std::tuple{s.ir, s.hub.select, s.hub.node_ir}] = value;
+    const Target tg = target(tap);
+    if (tg.channel) {
+        if (tg.command)
+            channel_receive(tap, tg, value);
+        return;
+    }
+    if (tg.reg && tg.reg->kind != RegisterSpec::Kind::rw)
+        return;
+    s.regs[key(tap)] = value;
 }
 
 Bits ChainModel::scan_dr(std::size_t tap, const Bits & in)

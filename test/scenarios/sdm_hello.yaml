@@ -1,0 +1,43 @@
+# Hello world for packet-service style nodes: one FPGA whose SLD hub carries an
+# "SDM" node with a command/response channel.
+#
+# Evidence status (see docs/mock-jtagd-design.md):
+#   - chain, hub and virtual-IR mechanics: documented, and exercised by the
+#     reference client.
+#   - node id, IRs and the GET_IDCODE exchange: PLACEHOLDERS. The header layout
+#     follows the SDM mailbox format in Intel's Mailbox Client IP user guide
+#     ([31:28] client, [27:24] id, [23:12] length in words, [10:0] command /
+#     error code; GET_IDCODE = 0x10). Whether the JTAG packet service frames
+#     its packets the same way is unknown. Replace with captured traffic.
+
+protocol_version: 13
+
+cables:
+  - hw_name: USB-BlasterII
+    port: "1-3"
+    chain:
+      - name: AGFB014R24A          # placeholder part
+        idcode: 0x4341_A0DD        # placeholder idcode
+        irlen: 10
+        provenance: placeholder
+        hub:
+          ir_bits: 4
+          nodes:
+            - name: virtual_jtag
+              idcode: { version: 1, node: 0x08, instance: 0 }
+            - name: sdm
+              idcode: { version: 1, node: 0x7A, instance: 0 }   # placeholder node id
+              provenance: placeholder
+              registers:
+                0x0: { kind: const, length: 32, value: 0x5D3_0001, provenance: placeholder } # "version"
+              channels:
+                - name: packets
+                  command_ir: 0x1
+                  response_ir: 0x2
+                  word_bits: 32
+                  idle: 0
+                  provenance: placeholder
+                  transcript:
+                    # GET_IDCODE, no arguments -> header (length 1, no error) + JTAG idcode
+                    - request:  [0x0000_0010]
+                      response: [0x0000_1000, 0x4341_A0DD]

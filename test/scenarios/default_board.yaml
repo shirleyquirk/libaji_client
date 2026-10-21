@@ -1,0 +1,22 @@
+# The same board as Scenario::default_board(): a Cyclone V SoC-ish chain with an
+# HPS DAP nearest TDO and an FPGA carrying a two-node SLD hub. Node IDCODEs are
+# illustrative.
+cables:
+  - hw_name: USB-Blaster
+    port: USB-1
+    chain:
+      - name: SOCVHPS
+        idcode: 0x4BA00477
+        irlen: 4
+        idcode_ir: 0xE
+      - name: 5CSEMA5
+        idcode: 0x02D120DD
+        irlen: 10
+        idcode_ir: 0x006
+        hub:
+          ir_bits: 8
+          nodes:
+            - name: node0
+              idcode: { version: 6, node: 0x00, instance: 0 }
+            - name: node1
+              idcode: { version: 1, node: 0x08, instance: 1 }

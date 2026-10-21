@@ -18,8 +18,8 @@ TEST_F(RoundTrip, GetNodesReadsHubRom)
     const Scenario scenario = Scenario::default_board();
     const SldHub & hub = *scenario.cables[0].taps[1].hub;
     ASSERT_EQ(hub.nodes.size(), n);
-    EXPECT_EQ(hub.nodes[0], idcodes[0]);
-    EXPECT_EQ(hub.nodes[1], idcodes[1]);
+    EXPECT_EQ(hub.nodes[0].idcode, idcodes[0]);
+    EXPECT_EQ(hub.nodes[1].idcode, idcodes[1]);
     EXPECT_EQ(hub.idcode(), hub_info);
 }
 
@@ -62,7 +62,7 @@ TEST_F(RoundTrip, ManyNodes)
     ASSERT_EQ(AJI_NO_ERROR, aji_get_nodes(chain, fpga_tap, idcodes, &n));
     ASSERT_EQ(20u, n);
     for (std::uint32_t i = 0; i < 20; ++i)
-        EXPECT_EQ(hub.nodes[i], idcodes[i]);
+        EXPECT_EQ(hub.nodes[i].idcode, idcodes[i]);
 }
 
 TEST_F(RoundTrip, OpenNodeAndAccessItsRegisters)

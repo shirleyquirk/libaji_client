@@ -1214,6 +1214,16 @@ std::vector<CommandRecord> Server::commands() const
     return impl_->records;
 }
 
+std::vector<std::string> Server::take_model_errors()
+{
+    std::lock_guard lk(impl_->mu);
+    std::vector<std::string> out;
+    for (auto & ch : impl_->chains)
+        for (auto & e : ch.model.take_errors())
+            out.push_back(std::format("{}: {}", ch.cable.hw_name, std::move(e)));
+    return out;
+}
+
 unsigned Server::connections() const
 {
     std::lock_guard lk(impl_->mu);
