@@ -164,6 +164,52 @@ EXPECT_TRUE(server.take_model_errors().empty());
 second, hand-rolled connection (e.g. to hold a lock the client then collides
 with).
 
+## Capturing from real hardware: jtag-proxy
+
+`jtag-proxy` sits between your code and a real jtagd, forwards everything
+unmodified, and records what passed: one line per **logical** scan, with
+batching undone, so the same operations log identically however the client
+packed them. Why it's built this way is in
+[`mock-jtagd-design.md`](mock-jtagd-design.md#capture-a-logical-scan-proxy-not-pcap).
+
+```sh
+# 1. on the machine with the board: jtagd running as usual on 1309
+build/test/jtag-proxy capture --upstream 127.0.0.1:1309 \
+    --scan-log scan.yaml --wire-log wire.txt [--names board.yaml]
+#    -> jtag-proxy listening on 127.0.0.1:41235 -> 127.0.0.1:1309
+#    -> client config: ReplaceLocalJtagServer = "127.0.0.1:41235";
+
+# 2. run your code with a client config containing that line
+QUARTUS_JTAG_CLIENT_CONFIG=proxy.conf ./your-tool ...
+
+# 3. Ctrl-C the proxy, then turn one node's traffic into scenario YAML
+build/test/jtag-proxy transcript --scan-log scan.yaml \
+    --node 0x0BD06E00 --command-ir 0x1 --response-ir 0x2 [--strip-idle 0] > sdm.yaml
+```
+
+What comes out:
+
+- **Scans** (echoed to stderr and written to `--scan-log` as a YAML list):
+  ```
+  s1 #57 USB-BlasterII [1-3] tap0 AGFB014R24A sdm (0BD06E00) IR 0x1  DR 32b w=00000010
+  s1 #58 USB-BlasterII [1-3] tap0 AGFB014R24A sdm (0BD06E00) IR 0x2  DR 32b r=00001000
+  ```
+  The proxy learns each hub's node table by watching the client's own
+  enumeration, so node scans carry the node IDCODE (and a name, with
+  `--names`) without being told the board layout.
+- **Wire log**: every packet and command with arguments, responses and FIFO
+  bytes, e.g. `S>C p7 2 of 3 responses: 0 1`. This is what answers
+  protocol questions such as how jtagd behaves after an error in a batch.
+- **Transcript**: a `channels:` snippet with `provenance: observed`, ready to
+  paste into a node (or a TAP) in a scenario file. Repeated identical
+  exchanges collapse; a request that got different responses is flagged,
+  since the mock replays the first. `--strip-idle` drops "nothing yet" words a
+  polling client read before the real response.
+
+Decoding never affects forwarding: if the decoder hits something it doesn't
+understand, it reports it and stops decoding that connection, and traffic
+keeps flowing.
+
 ## Standalone
 
 ```sh

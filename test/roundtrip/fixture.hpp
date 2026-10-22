@@ -5,6 +5,7 @@
 #pragma once
 
 #include "aji.h"
+#include "jtag_proxy/proxy.hpp"
 #include "mock_jtagd/scenario_yaml.hpp"
 #include "mock_jtagd/server.hpp"
 
@@ -41,7 +42,17 @@ protected:
     void start(Scenario scenario = Scenario::default_board(),
                std::optional<std::string> client_password = std::nullopt, bool register_server = true)
     {
-        server_ = std::make_unique<Server>(std::move(scenario), ServerOptions{.trace = trace_enabled()});
+        server_ = std::make_unique<Server>(scenario, ServerOptions{.trace = trace_enabled()});
+        std::uint16_t client_port = server_->port();
+        if (proxied_) {
+            // client -> jtag-proxy -> mock: the proxy stands where a real jtagd would be.
+            jtag_proxy::ProxyOptions po;
+            po.upstream_port = server_->port();
+            if (proxy_names_)
+                po.names = scenario;
+            proxy_ = std::make_unique<jtag_proxy::Proxy>(std::move(po));
+            client_port = proxy_->port();
+        }
         config_path_ = std::filesystem::path(::testing::TempDir()) /
                        std::format("aji_client_{}.conf", ::getpid());
         std::ofstream conf(config_path_);
@@ -49,12 +60,12 @@ protected:
             ::setenv("QUARTUS_JTAG_CLIENT_NO_LOCAL_SERVER", "1", 1);
         } else if (client_password) {
             conf << std::format("Remote1 {{\n  Host = \"127.0.0.1:{}\";\n  Password = \"{}\";\n}}\n",
-                                server_->port(), *client_password);
+                                client_port, *client_password);
             ::setenv("QUARTUS_JTAG_CLIENT_NO_LOCAL_SERVER", "1", 1);
         } else {
             // Replacing (rather than adding to) the local server also stops the
             // client from trying to launch a real jtagd when it can't connect.
-            conf << std::format("ReplaceLocalJtagServer = \"127.0.0.1:{}\";\n", server_->port());
+            conf << std::format("ReplaceLocalJtagServer = \"127.0.0.1:{}\";\n", client_port);
         }
         conf.close();
         ::setenv("QUARTUS_JTAG_CLIENT_CONFIG", config_path_.c_str(), 1);
@@ -66,8 +77,26 @@ protected:
         start(load_scenario(std::filesystem::path(MOCK_JTAGD_SCENARIO_DIR) / scenario_name));
     }
 
+    // Same as start(), with jtag-proxy between the client and the mock.
+    // `names`: give the proxy the scenario so it can label nodes.
+    void start_proxied(Scenario scenario, bool names = true)
+    {
+        proxied_ = true;
+        proxy_names_ = names;
+        start(std::move(scenario));
+    }
+    void start_proxied(const std::string & scenario_name, bool names = true)
+    {
+        start_proxied(load_scenario(std::filesystem::path(MOCK_JTAGD_SCENARIO_DIR) / scenario_name), names);
+    }
+
     void TearDown() override
     {
+        if (proxy_) {
+            proxy_->stop();
+            for (const auto & e : proxy_->decode_errors())
+                ADD_FAILURE() << "jtag-proxy decode error: " << e;
+        }
         if (server_) {
             // Anything left here means the code talked to hardware the scenario
             // doesn't describe (e.g. a request no transcript entry matches).
@@ -130,6 +159,9 @@ protected:
     static bool trace_enabled() { return std::getenv("MOCK_JTAGD_TRACE") != nullptr; }
 
     std::unique_ptr<Server> server_;
+    std::unique_ptr<jtag_proxy::Proxy> proxy_;
+    bool proxied_ = false;
+    bool proxy_names_ = true;
     std::filesystem::path config_path_;
 };
 

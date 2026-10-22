@@ -122,7 +122,7 @@ What would move each layer from "self-consistent" to "evidence":
    command/response exchange (SDM-style GET_IDCODE, placeholder transcript).
    *(done)*
 3. Dual-target fixture (checklist 1).
-4. jtag-proxy: wire log + scan log, then the scan-log → YAML converter.
+4. jtag-proxy: wire log + scan log, then the scan-log → YAML converter. *(done; unvalidated against a real jtagd)*
 5. `jtagconfig` importer (needs real dumps).
 6. `mock_jtagd::gtest` fixture library + CMake package for external projects.
 7. JTAG-to-Avalon master model.
