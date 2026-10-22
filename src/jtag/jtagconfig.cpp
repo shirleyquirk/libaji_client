@@ -766,7 +766,7 @@ const char * node_type_110_lo[] =
     /*   1 */ NULL, // OCP
     /*   2 */ NULL, // "SignalTap HDL"
     /*   3 */ "ROM/RAM/Constant",
-//    /*   4 */ "Serial Flash Loader",
+    /*   4 */ NULL, // "Serial Flash Loader"; must stay as a placeholder or every later name shifts down one
     /*   5 */ "Parallel Flash Loader",
     /*   6 */ "DSP Builder HIL",
     /*   7 */ "Logic Analyzer Interface",
